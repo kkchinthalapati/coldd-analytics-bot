@@ -1,0 +1,25 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# live data, backups, exports, logs
+data.json
+data*.json
+*.json.tmp
+*.json.lock
+*.corrupt-*
+backups/
+exports/
+logs/
+*.log
+*.json.gz
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
