@@ -16,7 +16,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from . import __version__, ai, analytics, scoring
+from . import __version__, ai, analytics, scoring, ui
 from .collector import Collector, SpamTracker, content_fingerprint
 from .config import Config
 from .storage import Store
@@ -25,6 +25,9 @@ from .timeutil import fmt_ts, now_ts, to_local
 log = logging.getLogger("coldd.bot")
 
 EMBED_DESC_LIMIT = 3900
+DEEPSCAN_COOLDOWN_S = 6 * 3600   # one deep scan per six hours, server-wide
+DEEPSCAN_TIMEOUT_S = 240         # long-form reports take far longer than a chat reply
+DEEPSCAN_KEEP = 6                # previous reports kept in data.json as the bot's memory
 UPLOAD_LIMIT = 8 * 1024 * 1024
 LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
 BRAND = 0x5DADE2
@@ -490,7 +493,9 @@ def register_commands(bot: ColddBot) -> None:
     async def help_cmd(inter: discord.Interaction) -> None:
         lines = [
             "**Staff commands** (results are only visible to you):",
-            "`/analytics [days]` server activity summary",
+            "`/analytics [days]` server activity dashboard",
+            "`/insights [days]` server health: growth, engagement, peak times, retention",
+            "`/summary [days]` AI-written summary of the same figures (aggregate only)",
             "`/audit [days]` full analytics audit (Markdown report attached)",
             "`/weekly show [week]` Member of the Week shortlist (0 = this week, -1 = last week)",
             "`/weekly nominate` record a staff nomination with a reason",
@@ -518,24 +523,158 @@ def register_commands(bot: ColddBot) -> None:
         days = clamp_days(days, cfg)
         s = analytics.summary(data(), cfg, days, today_for(cfg))
         cov = s["coverage"]
-        d = [
-            f"**Period:** {s['days'][0]} → {s['days'][-1]} ({cfg.timezone_name})",
-            f"**Messages:** {s['messages']:,} ({analytics.change(s['messages'], s['messages_prev'])} vs previous {days}d)",
-            f"**Unique active members:** {s['unique_active']:,} ({analytics.change(s['unique_active'], s['unique_active_prev'])})",
-            f"**Returning from previous period:** {s['returning']:,}",
-            f"**Per active member:** mean {s['avg_per_active']:.1f}, median {s['median_per_active']:.1f}",
-            f"**Top 10% share of messages:** {s['top10_share']:.0%}",
-            f"**Joins / departures:** {s['joins']:,} / {s['leaves']:,} (net {s['joins'] - s['leaves']:+,})",
-            f"**Voice hours observed:** {s['voice_hours']:.1f}",
-            f"**Peak hour:** {s['peak_hour']:02d}:00" if s["peak_hour"] is not None else "**Peak hour:** n/a",
-            f"**Daily messages:** `{analytics.sparkline([m for _, m, _ in s['daily']])}`",
-            f"**Coverage:** {cov['ratio']:.0%}" + (" ⚠️ incomplete — offline periods are not estimated" if cov["ratio"] < 0.9 else ""),
-        ]
+        net = s["joins"] - s["leaves"]
+        e = ui.card(f"Activity · last {days} days",
+                    f"{s['days'][0]} → {s['days'][-1]} · {cfg.timezone_name}\n"
+                    f"`{ui.spark([m for _, m, _ in s['daily']])}`  daily messages",
+                    inter.guild, ui.color_for(cov["ratio"]),
+                    footer=f"Coverage {ui.pct(cov['ratio'])} observed · counts are never estimated")
+        e.add_field(name="💬 Messages", value=f"**{s['messages']:,}**\n{ui.trend(s['messages'], s['messages_prev'])} vs prior {days}d", inline=True)
+        e.add_field(name="👥 Active members", value=f"**{s['unique_active']:,}**\n{ui.trend(s['unique_active'], s['unique_active_prev'])}", inline=True)
+        e.add_field(name="🔁 Returning", value=f"**{s['returning']:,}**\nfrom previous period", inline=True)
+        e.add_field(name="📥 Joins / 📤 leaves", value=f"**{s['joins']:,}** / **{s['leaves']:,}**\nnet {net:+,}", inline=True)
+        e.add_field(name="⏰ Peak hour", value=f"**{s['peak_hour']:02d}:00**" if s["peak_hour"] is not None else "n/a", inline=True)
+        e.add_field(name="🎙️ Voice", value=f"**{s['voice_hours']:.1f} h**\nobserved", inline=True)
+        e.add_field(name="📊 Per active member",
+                    value=f"mean **{s['avg_per_active']:.1f}** · median **{s['median_per_active']:.1f}**\n"
+                          f"top 10% send {ui.pct(s['top10_share'])} of messages", inline=False)
+        notes = []
         if s["coverage_prev"] < 0.9:
-            d.append(f"⚠️ Previous period only {s['coverage_prev']:.0%} observed: changes are not like-for-like.")
+            notes.append(f"Previous period only {ui.pct(s['coverage_prev'])} observed: changes are not like-for-like.")
+        if cov["ratio"] < 0.9:
+            notes.append("Offline periods are not estimated, so totals are a floor.")
         if s["member_detail_limited"]:
-            d.append(f"⚠️ Member detail only covers {cfg.member_retention_days} days.")
-        await inter.response.send_message(embed=embed(f"Activity: last {days} days", "\n".join(d)), ephemeral=True)
+            notes.append(f"Member detail only covers {cfg.member_retention_days} days.")
+        if notes:
+            e.add_field(name="⚠️ Notes", value="\n".join(notes), inline=False)
+        e.set_image(url=ui.banner_url())
+        await inter.response.send_message(embed=e, file=ui.banner_file(), ephemeral=True)
+
+    @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention (staff)")
+    @app_commands.describe(days="Number of days (default 30)")
+    async def insights_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:
+        if not access.is_staff(inter):
+            return await deny(inter)
+        days = clamp_days(days, cfg)
+        today = today_for(cfg)
+        ins = analytics.insights(data(), cfg, days, today)
+        top_ch = [r for r in analytics.channel_stats(data(), cfg, days, today) if r["messages"]][:5]
+        cov = ins["coverage"]["ratio"]
+
+        e = ui.card(f"Server insights · last {days} days", "", inter.guild, ui.color_for(cov),
+                    footer=f"Coverage {ui.pct(cov)} · timezone {cfg.timezone_name} · Discord's own Insights aren't exposed to bots")
+        e.add_field(name="📈 Growth",
+                    value=f"+**{ins['joins']:,}** joined · −**{ins['leaves']:,}** left\n"
+                          f"net **{ins['net']:+,}** (prior period {ins['net_prev']:+,})",
+                    inline=True)
+        e.add_field(name="🔥 Engagement",
+                    value=f"**{ins['mean_dau']:.0f}** avg daily active\n"
+                          f"**{ins['wau']:,}** active in the last 7 days\n"
+                          f"stickiness **{ui.pct(ins['stickiness'])}**",
+                    inline=True)
+
+        grid = ins["heatmap"]
+        peak = max((v for row in grid for v in row), default=0)
+        shades = " ░▒▓█"
+
+        def shade(v: int) -> str:
+            if not peak or not v:
+                return "   "
+            return shades[min(4, 1 + int(3 * v / peak))] * 3
+
+        blocks = ["0-4", "4-8", "8-12", "12-16", "16-20", "20-24"]
+        rows = ["    " + "".join(f"{b:^5}" for b in blocks)]
+        for name, row in zip(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], grid, strict=True):
+            rows.append(f"{name} " + "".join(f"{shade(v):^5}" for v in row))
+        e.add_field(name="🗓️ When people talk (local time, darker = busier)",
+                    value="```\n" + "\n".join(rows) + "\n```", inline=False)
+
+        if ins["cohorts"]:
+            lines = ["week         new  wk0   wk1   wk2-4"]
+            for wk, n, w0, w1, later in ins["cohorts"]:
+                lines.append(f"{wk}  {n:>3}  {w0:>4}  {w1:>4}  {later:>5}")
+            e.add_field(name="🧲 New-member retention (share still active)",
+                        value="```\n" + "\n".join(lines) + "\n```", inline=False)
+
+        if top_ch:
+            top = top_ch[0]["messages"]
+            e.add_field(name="📍 Top channels",
+                        value="\n".join(f"<#{r['cid']}> `{ui.bar(r['messages'], top, 8)}` {ui.pct(r['share'])}" for r in top_ch),
+                        inline=False)
+        await inter.response.send_message(embed=e, ephemeral=True)
+
+    @tree.command(name="deepscan", description="Deep AI analysis of every aggregate metric (staff, slow, rate-limited)")
+    async def deepscan_cmd(inter: discord.Interaction) -> None:
+        if not access.is_staff(inter):
+            return await deny(inter)
+        if not cfg.ai_enabled:
+            return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
+        meta = data()["meta"]
+        last = meta.get("last_deepscan") or 0
+        wait = DEEPSCAN_COOLDOWN_S - (now_ts() - last)
+        if wait > 0:
+            return await inter.response.send_message(
+                f"A deep scan ran recently. Next one available in about {math.ceil(wait / 3600)} h.", ephemeral=True)
+        today = today_for(cfg)
+        if not ai.budget_ok(data(), cfg, today.isoformat()):
+            return await inter.response.send_message("Daily AI request budget reached (AI_MAX_REQUESTS_PER_DAY).", ephemeral=True)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        ai.consume_budget(data())
+        meta["last_deepscan"] = now_ts()
+        stats = analytics.deep_stats(data(), cfg, today)
+        reports = meta.setdefault("ai_reports", [])
+        previous = reports[-1]["text"] if reports else None
+        try:
+            text = await asyncio.to_thread(ai.deep_report, cfg.with_ai_timeout(DEEPSCAN_TIMEOUT_S), stats, previous)
+        except ai.AIError as exc:
+            bot.collector.dirty = True
+            log.warning("Deep scan failed: %s", ai.redact(str(exc), cfg.secrets()))
+            return await inter.followup.send(f"Deep scan unavailable ({ai.redact(str(exc), cfg.secrets())}). Try again later.",
+                                             ephemeral=True)
+        reports.append({"at": now_ts(), "text": text})
+        del reports[:-DEEPSCAN_KEEP]
+        bot.collector.dirty = True
+        await bot.flush(reason="deep scan saved")
+        head = text[:3600] + ("\n…" if len(text) > 3600 else "")
+        e = ui.card(f"Deep scan · {today.isoformat()}", head, inter.guild,
+                    footer=f"{cfg.ai_model} · aggregate figures only · full report attached")
+        await inter.followup.send(embed=e, file=text_file(f"coldd-deepscan-{today.isoformat()}.md", text), ephemeral=True)
+
+    @tree.command(name="summary", description="AI-written summary of recent activity (staff, aggregate figures only)")
+    @app_commands.describe(days="Number of days (default 7)")
+    async def summary_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
+        if not access.is_staff(inter):
+            return await deny(inter)
+        if not cfg.ai_enabled:
+            return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
+        today = today_for(cfg).isoformat()
+        if not ai.budget_ok(data(), cfg, today):
+            return await inter.response.send_message("Daily AI request budget reached (AI_MAX_REQUESTS_PER_DAY).", ephemeral=True)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        days = clamp_days(days, cfg)
+        s = analytics.summary(data(), cfg, days, today_for(cfg))
+        stats = {
+            "period_days": days,
+            "messages": s["messages"], "messages_previous": s["messages_prev"],
+            "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
+            "returning_members": s["returning"],
+            "mean_messages_per_active": round(s["avg_per_active"], 2),
+            "median_messages_per_active": round(s["median_per_active"], 2),
+            "top10pct_message_share": round(s["top10_share"], 3),
+            "joins": s["joins"], "leaves": s["leaves"], "voice_hours": round(s["voice_hours"], 1),
+            "peak_hour": s["peak_hour"],
+            "coverage_ratio": round(s["coverage"]["ratio"], 3),
+            "coverage_ratio_previous": round(s["coverage_prev"], 3),
+            "daily_messages": [[d, m] for d, m, _ in s["daily"]],
+        }
+        ai.consume_budget(data())
+        try:
+            text = await asyncio.to_thread(ai.narrate, cfg, stats)
+        except ai.AIError as exc:
+            log.warning("AI summary failed: %s", ai.redact(str(exc), cfg.secrets()))
+            return await inter.followup.send(f"AI summary unavailable ({ai.redact(str(exc), cfg.secrets())}).", ephemeral=True)
+        e = ui.card(f"Summary · last {days} days", text, inter.guild, footer=f"AI-written from aggregate counts · {cfg.ai_model}")
+        await inter.followup.send(embed=e, ephemeral=True)
 
     @tree.command(name="audit", description="Run a full analytics audit (staff)")
     @app_commands.describe(days="Number of days to audit (default 30)")
@@ -564,21 +703,39 @@ def register_commands(bot: ColddBot) -> None:
             return await deny(inter)
         await inter.response.defer(ephemeral=True, thinking=True)
         r = week_result(week)
-        lines = []
-        for row in r["shortlist"]:
+        rows = r["shortlist"]
+        warn = [f"⚠️ {w}" for w in r["warnings"]]
+        if r["award"]:
+            paid = "paid ✅" if r["award"].get("paid") else "unpaid"
+            warn.insert(0, f"🏆 Recorded winner: <@{r['award']['winner']}> · {paid}")
+        e = ui.card(f"Member of the Week · {r['week']}",
+                    f"Award **{cfg.award_amount} {cfg.award_currency}** (paid manually)\n"
+                    f"Eligible **{r['eligible_count']}** of {r['considered_count']} · "
+                    f"coverage **{ui.pct(r['coverage']['ratio'])}**",
+                    inter.guild, ui.color_for(r["coverage"]["ratio"]),
+                    footer="Use /weekly approve to record a decision · full breakdown attached")
+        for row in rows[:3]:
             flag = " ⚠️" if row["flags"] else ""
             tie = " (tie)" if row["tie"] else ""
-            lines.append(f"`{row['rank']:>2}{tie}` <@{row['uid']}> **{row['score']:.1f}** · {row['effective_messages']} msgs · "
-                         f"{row['active_days']}d · {row['replies']}r/{row['reactions']}❤ · {row['nominations']}n{flag}")
-        head = [f"Week starting **{r['week']}** · award {cfg.award_amount} {cfg.award_currency} (manual)",
-                f"Eligible {r['eligible_count']} of {r['considered_count']} · coverage {r['coverage']['ratio']:.0%}"]
-        if r["award"]:
-            head.append(f"✅ Recorded winner: <@{r['award']['winner']}> (paid: {'yes' if r['award'].get('paid') else 'no'})")
-        head += [f"⚠️ {w}" for w in r["warnings"]]
-        body = "\n".join(head) + "\n\n" + ("\n".join(lines) or "No eligible candidates yet.")
-        body += "\n\nUse `/weekly approve` to record a decision. Full breakdown attached."
-        await inter.followup.send(embed=embed("Member of the Week shortlist", body),
-                                  file=text_file(f"weekly-{r['week']}.md", analytics.weekly_markdown(r, cfg)),
+            e.add_field(name=f"{ui.medal(row['rank'])} {tie.strip() or 'Rank ' + str(row['rank'])}{flag}",
+                        value=f"<@{row['uid']}>\n**{row['score']:.1f}** pts\n"
+                              f"{row['effective_messages']} msgs · {row['active_days']}d\n"
+                              f"{row['replies']} replies · {row['reactions']} ❤ · {row['nominations']} noms",
+                        inline=True)
+        if rows[3:]:
+            table = ["rank  score  msgs  days  r/❤   noms"]
+            for row in rows[3:]:
+                flag = "!" if row["flags"] else " "
+                table.append(f"{row['rank']:>4}  {row['score']:>5.1f}  {row['effective_messages']:>4}  "
+                             f"{row['active_days']:>4}  {row['replies']}/{row['reactions']:<4}  {row['nominations']:>4}{flag}")
+            e.add_field(name="More candidates", value="```\n" + "\n".join(table) + "\n```", inline=False)
+        if not rows:
+            e.add_field(name="No eligible candidates yet", value="Nothing met the minimums for this week.", inline=False)
+        if warn:
+            e.add_field(name="Notes", value="\n".join(warn)[:1024], inline=False)
+        e.set_image(url=ui.banner_url())
+        await inter.followup.send(embed=e,
+                                  files=[ui.banner_file(), text_file(f"weekly-{r['week']}.md", analytics.weekly_markdown(r, cfg))],
                                   ephemeral=True)
 
     @weekly.command(name="approve", description="Record the staff-chosen Member of the Week (no automatic payout)")
@@ -696,23 +853,29 @@ def register_commands(bot: ColddBot) -> None:
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         rows = analytics.leaderboard(data(), cfg, days, today_for(cfg), metric, limit=20)
         label = analytics.METRICS[metric][0]
-        lines = [f"`{r['rank']:>2}` <@{r['uid']}> · **{r['value']:,}** · {r['days']} active days" for r in rows]
-        await inter.response.send_message(embed=embed(f"Leaderboard: {label}, last {days} days",
-                                                      "\n".join(lines) or "No activity recorded."), ephemeral=True)
+        top = rows[0]["value"] if rows else 0
+        lines = [f"{ui.medal(r['rank'])} <@{r['uid']}>\n"
+                 f"┗ `{ui.bar(r['value'], top)}` **{r['value']:,}** · {r['days']} active days" for r in rows]
+        e = ui.card(f"Leaderboard · {label}", "\n".join(lines) or "No activity recorded.", inter.guild,
+                    footer=f"Last {days} days · top {len(rows)} · bars scaled to #1")
+        await inter.response.send_message(embed=e, ephemeral=True)
 
     @tree.command(name="channels", description="Channel activity analysis")
     async def channels_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
         if not access.is_staff(inter):
             return await deny(inter)
         days = clamp_days(days, cfg)
-        rows = analytics.channel_stats(data(), cfg, days, today_for(cfg))
-        lines = [f"<#{r['cid']}> **{r['messages']:,}** ({r['share']:.0%}) · {r['unique']} members · {r['trend']}"
-                 for r in rows if r["messages"] or r["prev"]][:25]
+        rows = [r for r in analytics.channel_stats(data(), cfg, days, today_for(cfg)) if r["messages"] or r["prev"]][:25]
+        top = rows[0]["messages"] if rows else 0
+        lines = [f"<#{r['cid']}>\n┗ `{ui.bar(r['messages'], top)}` **{r['messages']:,}** "
+                 f"({ui.pct(r['share'])}) · {r['unique']} members · {r['trend']}" for r in rows]
         unread = data()["meta"].get("unreadable_channels") or []
+        footer = f"Last {days} days"
         if unread:
-            lines.append(f"\n⚠️ {len(unread)} channel(s) unreadable by the bot (not counted).")
-        await inter.response.send_message(embed=embed(f"Channels: last {days} days", "\n".join(lines) or "No activity recorded."),
-                                          ephemeral=True)
+            footer += f" · ⚠️ {len(unread)} channel(s) unreadable, not counted"
+        e = ui.card(f"Channels · last {days} days", "\n".join(lines) or "No activity recorded.", inter.guild,
+                    ui.WARN if unread else ui.BRAND, footer=footer)
+        await inter.response.send_message(embed=e, ephemeral=True)
 
     @tree.command(name="member", description="A member's stored aggregate statistics")
     async def member_cmd(inter: discord.Interaction, user: discord.User, days: app_commands.Range[int, 1, 365] = 30) -> None:

@@ -43,7 +43,7 @@ def test_assess_anthropic(monkeypatch):
     out = ai.assess(ai_cfg(), ["hello", "world"])
     assert out["rating"] == 3 and out["n"] == 2
     assert seen["url"].endswith("/v1/messages") and seen["headers"]["x-api-key"] == KEY
-    assert seen["body"]["max_tokens"] == 300
+    assert seen["body"]["max_tokens"] == 4000  # headroom for reasoning models
 
 
 def test_assess_openai_compatible(monkeypatch):

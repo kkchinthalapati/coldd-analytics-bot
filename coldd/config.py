@@ -8,7 +8,7 @@ one pass from the hosting panel.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -135,6 +135,10 @@ class Config:
     @property
     def ai_enabled(self) -> bool:
         return bool(self.ai_provider and self.ai_api_key and self.ai_model)
+
+    def with_ai_timeout(self, seconds: int) -> Config:
+        """Copy of this config with a longer AI timeout (for slow, long-form calls)."""
+        return replace(self, ai_timeout=seconds)
 
     def secrets(self) -> list[str]:
         return [s for s in (self.token, self.ai_api_key) if s]

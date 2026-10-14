@@ -303,6 +303,105 @@ def member_stats(data: dict[str, Any], cfg: Config, uid: int, days_n: int, today
     }
 
 
+def insights(data: dict[str, Any], cfg: Config, days_n: int, today: date) -> dict[str, Any]:
+    """Server-health view built only from stored aggregates (Discord's own Insights are not exposed to bots).
+
+    * growth: joins, leaves, net, previous net
+    * engagement: mean daily active, trailing-7-day active, stickiness (mean DAU / WAU)
+    * heatmap: messages by weekday (Mon=0) and 4-hour block, 7 x 6
+    * retention: weekly cohorts of new members (from analytics._cohorts)
+    """
+    days = period(today, days_n)
+    prev = previous_period(today, days_n)
+    joins = sum(data["server"].get(d, {}).get("j", 0) for d in days)
+    leaves = sum(data["server"].get(d, {}).get("lv", 0) for d in days)
+    pj = sum(data["server"].get(d, {}).get("j", 0) for d in prev)
+    pl = sum(data["server"].get(d, {}).get("lv", 0) for d in prev)
+
+    dau = [len(data["days"].get(d, {}).get("u", {})) for d in days]
+    mean_dau = sum(dau) / len(dau) if dau else 0.0
+    last7 = days[-7:]
+    wau = len({u for d in last7 for u in data["days"].get(d, {}).get("u", {})})
+    mean_dau_7 = sum(len(data["days"].get(d, {}).get("u", {})) for d in last7) / max(1, len(last7))
+
+    grid = [[0] * 6 for _ in range(7)]
+    for d in days:
+        hourly = data["server"].get(d, {}).get("h")
+        if not hourly:
+            continue
+        wd = date.fromisoformat(d).weekday()
+        for hour, n in enumerate(hourly[:24]):
+            grid[wd][hour // 4] += n
+
+    return {
+        "joins": joins, "leaves": leaves, "net": joins - leaves, "net_prev": pj - pl,
+        "mean_dau": mean_dau, "wau": wau,
+        "stickiness": (mean_dau_7 / wau) if wau else 0.0,
+        "heatmap": grid,
+        "cohorts": _cohorts(data, cfg, today)[-6:],
+        "coverage": coverage_for(data, days, today, now_ts(), cfg),
+    }
+
+
+def _pick(sorted_vals: list[float], q: float) -> float:
+    """Nearest-rank percentile of an ascending list (0 when empty)."""
+    if not sorted_vals:
+        return 0.0
+    idx = min(len(sorted_vals) - 1, max(0, round(q * (len(sorted_vals) - 1))))
+    return float(sorted_vals[idx])
+
+
+def deep_stats(data: dict[str, Any], cfg: Config, today: date) -> dict[str, Any]:
+    """Every aggregate the bot holds, for the AI deep scan.
+
+    Contains no member names, member IDs or message text: only counts, distributions
+    and channel names. Windows are capped at the member-detail retention period.
+    """
+    windows = [w for w in (7, 30, 90) if w <= cfg.member_retention_days] or [cfg.member_retention_days]
+    out: dict[str, Any] = {
+        "as_of": today.isoformat(),
+        "timezone": cfg.timezone_name,
+        "retention_days": {"member_detail": cfg.member_retention_days, "server": cfg.server_retention_days},
+        "storage": {"members_on_file": len(data["members"]), "channels_on_file": len(data["channels"]),
+                    "award_weeks_recorded": len(data["awards"]), "nomination_weeks": len(data["nominations"])},
+        "windows": {},
+    }
+    for w in windows:
+        s = summary(data, cfg, w, today)
+        ins = insights(data, cfg, w, today)
+        vals = sorted(float(r["value"]) for r in leaderboard(data, cfg, w, today, "messages", limit=None))
+        chans = [r for r in channel_stats(data, cfg, w, today) if r["messages"]][:10]
+        out["windows"][f"{w}d"] = {
+            "messages": s["messages"], "messages_previous": s["messages_prev"],
+            "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
+            "returning_members": s["returning"],
+            "joins": s["joins"], "leaves": s["leaves"], "net_growth": ins["net"], "net_growth_previous": ins["net_prev"],
+            "mean_messages_per_active": round(s["avg_per_active"], 2),
+            "median_messages_per_active": round(s["median_per_active"], 2),
+            "top10pct_message_share": round(s["top10_share"], 3),
+            "distribution_messages_per_member": {"members": len(vals), "p50": _pick(vals, 0.5),
+                                                 "p90": _pick(vals, 0.9), "p99": _pick(vals, 0.99),
+                                                 "max": vals[-1] if vals else 0},
+            "mean_daily_active": round(ins["mean_dau"], 1), "weekly_active": ins["wau"],
+            "stickiness": round(ins["stickiness"], 3),
+            "voice_hours": round(s["voice_hours"], 1), "peak_hour": s["peak_hour"],
+            "heatmap_weekday_x_4h_blocks": ins["heatmap"],
+            "retention_cohorts": ins["cohorts"],
+            "coverage": round(s["coverage"]["ratio"], 3), "coverage_previous": round(s["coverage_prev"], 3),
+            "channels": [{"name": (data["channels"].get(r["cid"], {}).get("n") or "unknown"),
+                          "messages": r["messages"], "share": round(r["share"], 3), "unique_members": r["unique"],
+                          "trend": r["trend"]} for r in chans],
+        }
+    daily_days = period(today, min(90, cfg.server_retention_days))
+    out["daily_series_90d"] = [
+        [d, data["server"].get(d, {}).get("m", 0), data["server"].get(d, {}).get("j", 0),
+         data["server"].get(d, {}).get("lv", 0), data["server"].get(d, {}).get("cov", 0)]
+        for d in daily_days
+    ]
+    out["daily_series_columns"] = ["date", "messages", "joins", "leaves", "observed_seconds"]
+    return out
+
+
 def sparkline(values: list[int]) -> str:
     bars = "▁▂▃▄▅▆▇█"
     top = max(values) if values else 0
