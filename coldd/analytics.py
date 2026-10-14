@@ -343,6 +343,79 @@ def insights(data: dict[str, Any], cfg: Config, days_n: int, today: date) -> dic
     }
 
 
+# --- community boards (/top, /profile) ----------------------------------------
+
+COMMUNITY_METRICS: dict[str, tuple[str, str, Any]] = {
+    "messages": ("Most messages", "msgs", lambda a: a["eff"]),
+    "consistency": ("Most consistent (active days)", "days", lambda a: a["days"]),
+    "streak": ("Longest streak (consecutive days)", "days", lambda a: a["streak"]),
+    "reacting": ("Most reactions given", "reactions", lambda a: a["rg"]),
+    "interactions": ("Most interactive (replies and reactions, both ways)", "interactions",
+                     lambda a: a["r"] + a["rg"] + a["rx"]),
+    "helpful": ("Most helpful (replies and reactions received)", "points", lambda a: a["r"] + a["rx"]),
+    "voice": ("Most voice time", "min", lambda a: round(a["v"] / 60)),
+}
+
+
+def member_table(data: dict[str, Any], cfg: Config, days_n: int, today: date) -> dict[str, dict[str, Any]]:
+    """Per-member figures for one window, computed in a single pass. Bots and excluded roles are kept
+    out of rankings by is_human; daily caps apply the same way as the weekly scoring."""
+    days = period(today, days_n)
+    agg: dict[str, dict[str, Any]] = {}
+    run: dict[str, int] = {}
+    best: dict[str, int] = {}
+    for day in days:
+        users = data["days"].get(day, {}).get("u", {})
+        active_today = set()
+        for uid, rec in users.items():
+            if rec.get("m", 0) > 0:
+                active_today.add(uid)
+            a = agg.setdefault(uid, {"eff": 0, "m": 0, "days": 0, "streak": 0, "r": 0, "rx": 0, "rg": 0, "v": 0})
+            m = rec.get("m", 0)
+            a["m"] += m
+            a["eff"] += min(max(0, m - rec.get("d", 0) - rec.get("b", 0)), cfg.daily_message_cap)
+            a["days"] += 1 if m > 0 else 0
+            a["r"] += min(rec.get("r", 0), cfg.daily_reply_cap)
+            a["rx"] += min(rec.get("rx", 0), cfg.daily_reaction_cap)
+            a["rg"] += min(rec.get("rg", 0), cfg.daily_reaction_cap)
+            a["v"] += rec.get("v", 0)
+        for uid in list(run):
+            if uid not in active_today:
+                run[uid] = 0
+        for uid in active_today:
+            run[uid] = run.get(uid, 0) + 1
+            best[uid] = max(best.get(uid, 0), run[uid])
+    for uid, a in agg.items():
+        a["streak"] = best.get(uid, 0)
+        a["window_days"] = len(days)
+    return {uid: a for uid, a in agg.items() if is_human(data, uid)}
+
+
+def community_board(data: dict[str, Any], cfg: Config, days_n: int, today: date, metric: str,
+                    limit: int = 10) -> list[dict[str, Any]]:
+    _, _, key = COMMUNITY_METRICS[metric]
+    rows = [{"uid": uid, "name": name_of(data, uid), "value": key(a), **a}
+            for uid, a in member_table(data, cfg, days_n, today).items()]
+    rows = [r for r in rows if r["value"] > 0]
+    rows.sort(key=lambda r: (-r["value"], -r["days"], r["uid"]))
+    for i, r in enumerate(rows):
+        r["rank"] = i + 1
+    return rows[:limit] if limit else rows
+
+
+def member_profile(data: dict[str, Any], cfg: Config, uid: str, days_n: int, today: date) -> dict[str, Any] | None:
+    """One member's figures plus their rank and total ranked members for every community metric."""
+    table = member_table(data, cfg, days_n, today)
+    if uid not in table:
+        return None
+    ranks: dict[str, dict[str, int]] = {}
+    for metric, (_, _, key) in COMMUNITY_METRICS.items():
+        ordered = sorted((key(a) for a in table.values() if key(a) > 0), reverse=True)
+        mine = key(table[uid])
+        ranks[metric] = {"rank": (ordered.index(mine) + 1) if mine > 0 else 0, "of": len(ordered), "value": mine}
+    return {"name": name_of(data, uid), "figures": table[uid], "ranks": ranks, "window_days": len(period(today, days_n))}
+
+
 def _pick(sorted_vals: list[float], q: float) -> float:
     """Nearest-rank percentile of an ascending list (0 when empty)."""
     if not sorted_vals:

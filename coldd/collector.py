@@ -286,12 +286,27 @@ class Collector:
         if not self.cfg.reactions_enabled:
             return False
         entry = self.recent.get(message_id)
-        if entry is None:
-            return False
-        author = entry[0]
+        author = entry[0] if entry is not None else None
         if author == reactor_id:
-            return False
-        reactors: set[int] | None = entry[5]
+            return False  # self-reactions count for nothing
+        reactors: set[int] | None = entry[5] if entry is not None else None
+
+        # Reactions GIVEN: credited to the reactor on the day of the reaction. One per member per cached message;
+        # for uncached messages every add counts, and the daily cap in scoring/ranking limits spam.
+        day = day_key(ts, self.cfg.tz)
+        if added:
+            if reactors is None or reactor_id not in reactors:
+                inc(self.user_day(day, reactor_id), "rg")
+                self.dirty = True
+        else:
+            rec = self.data["days"].get(day, {}).get("u", {}).get(str(reactor_id))
+            if rec is not None:
+                inc(rec, "rg", -1)
+                self.dirty = True
+
+        if entry is None:
+            return added
+        # Reactions RECEIVED: credited to the author for messages in the recent cache.
         if added:
             if reactors is None:
                 reactors = entry[5] = set()

@@ -550,6 +550,77 @@ def register_commands(bot: ColddBot) -> None:
         e.set_image(url=ui.banner_url())
         await inter.response.send_message(embed=e, file=ui.banner_file(), ephemeral=True)
 
+    community_choices = [app_commands.Choice(name=label, value=key) for key, (label, _, _) in analytics.COMMUNITY_METRICS.items()]
+
+    @tree.command(name="top", description="Community leaderboard: messages, consistency, streaks, reactions, interactions")
+    @app_commands.describe(metric="What to rank by", days="Window in days (default 7)", ai_highlight="Add a short AI highlight (uses AI budget)")
+    @app_commands.choices(metric=community_choices)
+    async def top_cmd(inter: discord.Interaction, metric: str = "messages",
+                      days: app_commands.Range[int, 1, 90] = 7, ai_highlight: bool = False) -> None:
+        days = min(clamp_days(days, cfg), cfg.member_retention_days)
+        today = today_for(cfg)
+        label, unit, _ = analytics.COMMUNITY_METRICS[metric]
+        rows = analytics.community_board(data(), cfg, days, today, metric, limit=10)
+        top = rows[0]["value"] if rows else 0
+        lines = [f"{ui.medal(r['rank'])} <@{r['uid']}>\n"
+                 f"┗ `{ui.bar(r['value'], top)}` **{r['value']:,}** {unit}" for r in rows]
+        e = ui.card(f"{label} · last {days} days", "\n".join(lines) or "No activity recorded in this window.", inter.guild,
+                    footer=f"Top {len(rows)} · bars scaled to #1 · {cfg.timezone_name}")
+        if ai_highlight and rows and cfg.ai_enabled and ai.budget_ok(data(), cfg, today.isoformat()):
+            await inter.response.defer(thinking=True)
+            facts = {"metric": label, "unit": unit, "window_days": days, "ranked_members": len(rows),
+                     "values": [r["value"] for r in rows], "leader_value": top}
+            ai.consume_budget(data())
+            try:
+                e.add_field(name="✨ Highlight", value=await asyncio.to_thread(ai.brief, cfg, facts), inline=False)
+            except ai.AIError as exc:
+                log.warning("AI highlight failed: %s", ai.redact(str(exc), cfg.secrets()))
+            return await inter.followup.send(embed=e)
+        await inter.response.send_message(embed=e)
+
+    @tree.command(name="motw", description="Member of the Week: current leaders (public)")
+    async def motw_cmd(inter: discord.Interaction) -> None:
+        await inter.response.defer(thinking=True)
+        r = week_result(0)
+        rows = r["shortlist"][:5]
+        if not rows:
+            e = ui.card("Member of the Week", "Nobody meets the minimums yet this week. Keep chatting!", inter.guild)
+        else:
+            lines = [f"{ui.medal(row['rank'])} <@{row['uid']}> · **{row['score']:.1f}** pts · "
+                     f"{row['effective_messages']} msgs · {row['active_days']} active days · "
+                     f"{row['reactions']} reactions received" for row in rows]
+            e = ui.card(f"Member of the Week · week of {r['week']}", "\n".join(lines), inter.guild,
+                        footer=f"Winner announced by staff · award {cfg.award_amount} {cfg.award_currency} · coverage {ui.pct(r['coverage']['ratio'])}")
+        await inter.followup.send(embed=e)
+
+    @tree.command(name="profile", description="Your community profile (staff can view anyone)")
+    @app_commands.describe(member="Member to view (staff only for others)", days="Window in days (default 30)")
+    async def profile_cmd(inter: discord.Interaction, member: discord.Member | None = None,
+                          days: app_commands.Range[int, 1, 90] = 30) -> None:
+        target = member or inter.user
+        if target.id != inter.user.id and not access.is_staff(inter):
+            return await deny(inter, "staff (you can view your own profile)")
+        days = min(clamp_days(days, cfg), cfg.member_retention_days)
+        p = analytics.member_profile(data(), cfg, str(target.id), days, today_for(cfg))
+        if p is None:
+            return await inter.response.send_message("No activity recorded for that member in this window.", ephemeral=True)
+        f, rk = p["figures"], p["ranks"]
+
+        def place(metric: str) -> str:
+            r = rk[metric]
+            return f"#{r['rank']} of {r['of']}" if r["rank"] else "unranked"
+
+        e = ui.card(f"Profile · {target.display_name}", f"Last {days} days · {cfg.timezone_name}", inter.guild)
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="💬 Messages", value=f"**{f['eff']:,}** · {place('messages')}", inline=True)
+        e.add_field(name="📅 Active days", value=f"**{f['days']}** of {p['window_days']} · {place('consistency')}", inline=True)
+        e.add_field(name="🔥 Best streak", value=f"**{f['streak']}** days · {place('streak')}", inline=True)
+        e.add_field(name="❤️ Reactions given", value=f"**{f['rg']:,}** · {place('reacting')}", inline=True)
+        e.add_field(name="🤝 Interactions", value=f"**{f['r'] + f['rg'] + f['rx']:,}** · {place('interactions')}", inline=True)
+        e.add_field(name="⭐ Helpful", value=f"replies {f['r']} · reactions received {f['rx']} · {place('helpful')}", inline=True)
+        e.add_field(name="🎙️ Voice", value=f"**{round(f['v'] / 60)} min** · {place('voice')}", inline=True)
+        await inter.response.send_message(embed=e, ephemeral=True)
+
     @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention (staff)")
     @app_commands.describe(days="Number of days (default 30)")
     async def insights_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:

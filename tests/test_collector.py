@@ -121,7 +121,14 @@ def test_reactions(collector, data):
     assert data["days"]["2026-10-12"]["u"]["1"]["rx"] == 2
     assert collector.record_reaction(100, 2, T, False)
     assert data["days"]["2026-10-12"]["u"]["1"]["rx"] == 1
-    assert not collector.record_reaction(555, 2, T, True)  # unknown message
+    # reactions given: member 2 added then removed (back to 0), member 3 added once, self-reaction counts for nothing
+    assert "rg" not in data["days"]["2026-10-12"]["u"]["2"]
+    assert data["days"]["2026-10-12"]["u"]["3"]["rg"] == 1
+    assert "rg" not in data["days"]["2026-10-12"]["u"]["1"]
+    # uncached message: no rx credit to anyone, but the reaction still counts as given
+    assert collector.record_reaction(555, 2, T, True)
+    assert data["days"]["2026-10-12"]["u"]["2"]["rg"] == 1
+    assert data["days"]["2026-10-12"]["u"]["1"]["rx"] == 1
 
 
 def test_reactions_disabled(data):
