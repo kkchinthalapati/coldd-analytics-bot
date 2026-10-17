@@ -761,10 +761,15 @@ def register_commands(bot: ColddBot) -> None:
         if r["award"]:
             paid = "paid ✅" if r["award"].get("paid") else "unpaid"
             warn.insert(0, f"🏆 Recorded winner: <@{r['award']['winner']}> · {paid}")
+        reign_line = ""
+        if rows:
+            held = scoring.reign_length(data(), str(rows[0]["uid"]), date.fromisoformat(r["week"]))
+            if held:
+                reign_line = f"\n👑 <@{rows[0]['uid']}> has held the title for **{held}** consecutive week(s) so far"
         e = ui.card(f"Member of the Week · {r['week']}",
                     f"Award **{cfg.award_amount} {cfg.award_currency}** (paid manually)\n"
                     f"Eligible **{r['eligible_count']}** of {r['considered_count']} · "
-                    f"coverage **{ui.pct(r['coverage']['ratio'])}**",
+                    f"coverage **{ui.pct(r['coverage']['ratio'])}**" + reign_line,
                     inter.guild, ui.color_for(r["coverage"]["ratio"]),
                     footer="Use /weekly approve to record a decision · full breakdown attached")
         for row in rows[:3]:

@@ -49,6 +49,7 @@ class Candidate:
     reactions: int = 0
     nominations: int = 0
     voice_minutes: float = 0.0
+    reactions_given: int = 0
     imported: int = 0
     channels: int = 0
     components: dict[str, float] = field(default_factory=dict)
@@ -106,6 +107,18 @@ def _recent_winners(data: dict[str, Any], start: date, cooldown_weeks: int) -> s
     }
 
 
+def reign_length(data: dict[str, Any], uid: str, start: date) -> int:
+    """Consecutive recorded weeks, ending the week before `start`, that this member won."""
+    n = 0
+    wk = start - timedelta(weeks=1)
+    while True:
+        award = data["awards"].get(wk.isoformat())
+        if not award or str(award.get("winner")) != uid:
+            return n
+        n += 1
+        wk -= timedelta(weeks=1)
+
+
 def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None = None) -> dict[str, Any]:
     t0 = time.perf_counter()
     now = int(time.time()) if now is None else now
@@ -135,6 +148,7 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
             c.replies += min(rec.get("r", 0), cfg.daily_reply_cap)
             c.reactions += min(rec.get("rx", 0), cfg.daily_reaction_cap)
             c.voice_minutes += rec.get("v", 0) / 60
+            c.reactions_given += min(rec.get("rg", 0), cfg.daily_reaction_cap)
             c.imported += rec.get("i", 0)
             c.channels = max(c.channels, len(rec.get("c", {})))
 
@@ -176,9 +190,11 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
     max_msgs = maxof("effective_messages")
     max_help = max((c.helpful_points + cfg.nomination_weight * c.nominations for c in eligible), default=0)
     max_voice = maxof("voice_minutes")
+    max_given = maxof("reactions_given")
 
     available = {"participation": True, "consistency": True,
-                 "helpfulness": max_help > 0, "extra": cfg.voice_enabled and max_voice > 0}
+                 "helpfulness": max_help > 0,
+                 "extra": (cfg.voice_enabled and max_voice > 0) or max_given > 0}
     raw_weights = cfg.weights.as_dict()
     total_w = sum(w for k, w in raw_weights.items() if available[k])
     weights = {k: (w / total_w if available[k] and total_w else 0.0) for k, w in raw_weights.items()}
@@ -191,7 +207,14 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
         if available["helpfulness"]:
             comp["helpfulness"] = (c.helpful_points + cfg.nomination_weight * c.nominations) / max_help
         if available["extra"]:
-            comp["extra"] = math.sqrt(c.voice_minutes) / math.sqrt(max_voice)
+            # "extra" averages voice time and reactions given (each relative to the best eligible candidate),
+            # so consistent reacting counts even on servers with voice disabled.
+            parts = []
+            if cfg.voice_enabled and max_voice > 0:
+                parts.append(math.sqrt(c.voice_minutes) / math.sqrt(max_voice))
+            if max_given > 0:
+                parts.append(math.sqrt(c.reactions_given) / math.sqrt(max_given))
+            comp["extra"] = sum(parts) / len(parts) if parts else 0.0
         c.components = comp
         c.score = 100 * sum(weights[k] * v for k, v in comp.items())
         if c.messages_raw and (c.duplicates + c.bursts) / c.messages_raw >= cfg.spam_flag_ratio:

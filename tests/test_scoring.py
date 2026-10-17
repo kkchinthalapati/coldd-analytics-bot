@@ -154,7 +154,7 @@ def test_approve_winner_manual_and_protected(data):
     ok, msg = approve_winner(data, cfg, r, 1, 900, "great week")
     assert ok and "manual" in msg
     a = data["awards"][WEEK.isoformat()]
-    assert a["winner"] == "1" and a["paid"] is False and a["amount"] == 100 and a["on_shortlist"]
+    assert a["winner"] == "1" and a["paid"] is False and a["amount"] == 150 and a["on_shortlist"]
     ok, msg = approve_winner(data, cfg, r, 2, 900)
     assert not ok and "already" in msg
     ok, msg = approve_winner(data, cfg, r, 2, 900, replace=True)
@@ -168,3 +168,33 @@ def test_weights_configurable(data):
     put(data, 2, 0, m=1); put(data, 2, 1, m=1)
     r = score_week(data, cfg, WEEK, AFTER)
     assert r["shortlist"][0]["uid"] == "2"
+
+
+def test_reactions_given_count_when_voice_is_disabled(cfg, data):
+    from datetime import date as _d
+
+    from coldd import scoring
+    start = _d(2026, 10, 5)  # a Monday
+    cfg.voice_enabled = False
+    for i in range(3):  # eligible needs >= 3 active days and >= 20 effective messages
+        day = (start + timedelta(days=i)).isoformat()
+        data["days"][day] = {"u": {"1": {"m": 10, "rg": 7}, "2": {"m": 10, "rg": 1}}}
+        data["server"][day] = {"cov": 86400, "m": 20}
+    res = scoring.score_week(data, cfg, start, now=2_000_000_000)  # a finished week
+    rows = {c["uid"]: c for c in res["shortlist"]}
+    assert rows["1"]["components"]["extra"] > rows["2"]["components"]["extra"]
+
+
+def test_reign_counts_consecutive_winners(cfg, data):
+    from datetime import date as _d
+
+    from coldd import scoring
+    start = _d(2026, 10, 19)
+    data["awards"] = {
+        "2026-10-05": {"winner": "7"},
+        "2026-10-12": {"winner": "7"},
+        "2026-09-28": {"winner": "7"},
+        "2026-09-21": {"winner": "9"},
+    }
+    assert scoring.reign_length(data, "7", start) == 3
+    assert scoring.reign_length(data, "9", start) == 0

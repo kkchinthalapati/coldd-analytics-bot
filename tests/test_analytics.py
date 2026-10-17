@@ -108,7 +108,7 @@ def test_weekly_markdown_formatting():
     cfg, data = build()
     r = score_week(data, cfg, date(2026, 10, 5), now=ts(TODAY, 23))
     md = analytics.weekly_markdown(r, cfg)
-    assert "100 Robux" in md and "| Rank |" in md and "How the score is calculated" in md
+    assert "150 Robux" in md and "| Rank |" in md and "How the score is calculated" in md
 
 
 def test_helpers():

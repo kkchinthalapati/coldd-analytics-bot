@@ -107,7 +107,7 @@ class Config:
     voice_min_members: int = 2
     reactions_enabled: bool = True
 
-    award_amount: int = 100
+    award_amount: int = 150
     award_currency: str = "Robux"
     weights: Weights = field(default_factory=Weights)
     daily_message_cap: int = 60
@@ -116,7 +116,7 @@ class Config:
     min_weekly_messages: int = 20
     min_active_days: int = 3
     min_daily_messages_for_active: int = 1
-    winner_cooldown_weeks: int = 4
+    winner_cooldown_weeks: int = 0
     shortlist_size: int = 10
     spam_flag_ratio: float = 0.30
     nomination_weight: float = 5.0
@@ -348,7 +348,7 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         voice_enabled=as_bool("VOICE_ENABLED", True),
         voice_min_members=as_int("VOICE_MIN_MEMBERS", 2, 1, 100),
         reactions_enabled=as_bool("REACTIONS_ENABLED", True),
-        award_amount=as_int("AWARD_AMOUNT", 100, 0, 1_000_000),
+        award_amount=as_int("AWARD_AMOUNT", 150, 0, 1_000_000),
         award_currency=get("AWARD_CURRENCY", "Robux") or "Robux",
         weights=weights,
         daily_message_cap=as_int("DAILY_MESSAGE_CAP", 60, 1, 10000),
@@ -357,7 +357,7 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         min_weekly_messages=as_int("MIN_WEEKLY_MESSAGES", 20, 0, 100000),
         min_active_days=as_int("MIN_ACTIVE_DAYS", 3, 0, 7),
         min_daily_messages_for_active=as_int("MIN_DAILY_MESSAGES_FOR_ACTIVE", 1, 1, 1000),
-        winner_cooldown_weeks=as_int("WINNER_COOLDOWN_WEEKS", 4, 0, 520),
+        winner_cooldown_weeks=as_int("WINNER_COOLDOWN_WEEKS", 0, 0, 520),
         shortlist_size=as_int("SHORTLIST_SIZE", 10, 3, 25),
         spam_flag_ratio=as_float("SPAM_FLAG_RATIO", 0.30, 0, 1),
         nomination_weight=as_float("NOMINATION_WEIGHT", 5.0, 0, 1000),
