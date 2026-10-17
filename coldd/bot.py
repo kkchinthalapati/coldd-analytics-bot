@@ -1037,21 +1037,38 @@ def register_commands(bot: ColddBot) -> None:
     async def run_import(inter: discord.Interaction, targets: list[Any], days: int) -> None:
         totals = {"imported": 0, "skipped": 0, "windows": 0}
         failed: list[str] = []
+        total = len(targets)
+        progress_msg: discord.Message | None = None
         try:
-            for ch in targets:
+            progress_msg = await inter.channel.send(f"Importing {days} days · starting {total} channel(s)…")
+        except (discord.HTTPException, AttributeError):
+            log.warning("Could not post the import progress message; progress goes to logs only.")
+        last_edit = 0.0
+        try:
+            for done, ch in enumerate(targets, 1):
                 try:
                     res = await bot.import_history(ch, days, None)
                 except discord.Forbidden:
                     failed.append(f"{ch.mention}: no access")
-                    continue
+                    res = {}
                 except Exception as exc:  # keep going: one bad channel must not stop the rest
                     log.exception("History import failed for channel %s", ch.id)
                     failed.append(f"{ch.mention}: {type(exc).__name__}")
-                    continue
+                    res = {}
                 for k in totals:
                     totals[k] += res.get(k, 0)
                 if res.get("note"):
                     failed.append(f"{ch.mention}: {res['note']}")
+                log.info("History import %d/%d done (%s)", done, total, ch.id)
+                # Edit the progress message at most every 15 seconds, and always on the last channel.
+                if progress_msg and (time.monotonic() - last_edit >= 15 or done == total):
+                    last_edit = time.monotonic()
+                    try:
+                        await progress_msg.edit(content=(
+                            f"Importing {days} days · `{ui.bar(done, total, 20)}` {done}/{total} channels · "
+                            f"{totals['imported']:,} messages imported so far"))
+                    except discord.HTTPException:
+                        pass
         finally:
             bot._import_running = False
         e = ui.card(f"History import · last {days} days",
