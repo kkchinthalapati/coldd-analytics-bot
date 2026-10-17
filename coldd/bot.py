@@ -1064,10 +1064,58 @@ def register_commands(bot: ColddBot) -> None:
         lines = [f"**{k}:** {v}" for k, v in cfg.safe_summary().items()]
         await inter.response.send_message(embed=embed("Configuration (secrets hidden)", "\n".join(lines)), ephemeral=True)
 
-    @tree.command(name="import_history", description="Owner: import missed message history for one channel (rate-limited)")
-    @app_commands.describe(channel="Text channel to import", days="How far back (max = member retention)")
-    async def import_cmd(inter: discord.Interaction, channel: discord.TextChannel,
-                         days: app_commands.Range[int, 1, 365] = 7) -> None:
+    def readable_targets(guild: discord.Guild) -> list[Any]:
+        """Every text channel and active thread the bot can read and that isn't excluded by configuration."""
+        me = guild.me
+        out: list[Any] = []
+        for ch in [*guild.text_channels, *guild.threads]:
+            perms = ch.permissions_for(me)
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            _, check_ids = bot._resolve_channel(ch)
+            if bot.collector.channel_allowed(*check_ids):
+                out.append(ch)
+        return out
+
+    async def run_import(inter: discord.Interaction, targets: list[Any], days: int) -> None:
+        totals = {"imported": 0, "skipped": 0, "windows": 0}
+        failed: list[str] = []
+        try:
+            for ch in targets:
+                try:
+                    res = await bot.import_history(ch, days, None)
+                except discord.Forbidden:
+                    failed.append(f"{ch.mention}: no access")
+                    continue
+                except Exception as exc:  # keep going: one bad channel must not stop the rest
+                    log.exception("History import failed for channel %s", ch.id)
+                    failed.append(f"{ch.mention}: {type(exc).__name__}")
+                    continue
+                for k in totals:
+                    totals[k] += res.get(k, 0)
+                if res.get("note"):
+                    failed.append(f"{ch.mention}: {res['note']}")
+        finally:
+            bot._import_running = False
+        e = ui.card(f"History import · last {days} days",
+                    f"Channels processed: **{len(targets)}**\n"
+                    f"Messages imported: **{totals['imported']:,}** · bot messages skipped: **{totals['skipped']:,}**\n"
+                    f"Uncovered windows filled: **{totals['windows']}**",
+                    inter.guild, ui.WARN if failed else ui.BRAND,
+                    footer="Imported messages are labelled separately · reactions are not back-filled")
+        if failed:
+            e.add_field(name="Skipped or failed", value="\n".join(failed)[:1024], inline=False)
+        try:
+            await inter.channel.send(content=inter.user.mention, embed=e)
+        except discord.HTTPException:
+            log.warning("Could not post the import report in the invoking channel; see logs for totals.")
+            log.info("History import finished: %s; failed: %s", totals, failed)
+
+    @tree.command(name="import_history", description="Owner: import past messages for one channel, or every readable channel")
+    @app_commands.describe(channel="One channel (leave empty for every channel the bot can read)",
+                           days="How far back (max = member retention)")
+    async def import_cmd(inter: discord.Interaction, channel: discord.TextChannel | None = None,
+                         days: app_commands.Range[int, 1, 365] = 90) -> None:
         if not access.is_owner(inter):
             return await deny(inter, "the owner")
         if not cfg.history_import_enabled:
@@ -1076,27 +1124,16 @@ def register_commands(bot: ColddBot) -> None:
         if bot._import_running:
             return await inter.response.send_message("An import is already running.", ephemeral=True)
         days = min(days, cfg.member_retention_days)
-        await inter.response.defer(ephemeral=True, thinking=True)
+        targets = [channel] if channel else readable_targets(inter.guild)
+        if not targets:
+            return await inter.response.send_message("The bot can't read any channels to import.", ephemeral=True)
         bot._import_running = True
-
-        async def progress(n: int) -> None:
-            if n % 2000 == 0:
-                try:
-                    await inter.edit_original_response(content=f"Importing… {n:,} messages so far.")
-                except discord.HTTPException:
-                    pass
-
-        try:
-            res = await bot.import_history(channel, days, progress)
-        except discord.Forbidden:
-            return await inter.followup.send("The bot cannot read that channel's history (needs Read Message History).", ephemeral=True)
-        finally:
-            bot._import_running = False
-        note = res.get("note", "")
-        await inter.followup.send(
-            f"Imported {res['imported']:,} messages from {channel.mention} across {res['windows']} uncovered window(s); "
-            f"{res['skipped']:,} bot messages skipped. Imported activity is labelled separately in reports. "
-            f"Already-observed or already-imported periods were skipped. {note}", ephemeral=True)
+        # The import can run for a long time, longer than Discord allows for a reply, so it runs in the background
+        # and the report is posted to the channel where the command was run.
+        asyncio.create_task(run_import(inter, targets, days))
+        await inter.response.send_message(
+            f"Importing {days} days from {len(targets)} channel(s) in the background. "
+            f"The report will be posted here when it finishes.", ephemeral=True)
 
     @tree.command(name="forget", description="Owner: delete a member's stored statistics (privacy request)")
     async def forget_cmd(inter: discord.Interaction, user: discord.User, confirm: bool = False) -> None:
