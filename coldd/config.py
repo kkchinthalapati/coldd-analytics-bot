@@ -55,6 +55,16 @@ class Weights:
         }
 
 
+@dataclass(frozen=True)
+class AIRoute:
+    """One AI provider to try: style is "openai" (chat/completions) or "anthropic" (messages)."""
+    name: str
+    style: str
+    base_url: str
+    api_key: str
+    model: str
+
+
 @dataclass
 class Config:
     token: str
@@ -116,6 +126,13 @@ class Config:
     history_import_enabled: bool = False
     history_import_max_messages: int = 20000
 
+    # Tried in this order: Gemini, OpenRouter, then the generic AI_* provider (Radox). Any may be left blank.
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
     ai_provider: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
@@ -134,14 +151,24 @@ class Config:
 
     @property
     def ai_enabled(self) -> bool:
-        return bool(self.ai_provider and self.ai_api_key and self.ai_model)
+        return bool(self.ai_chain())
+
+    def ai_chain(self) -> list[AIRoute]:
+        """Providers to try, in order. A route is included only when its key and model are set."""
+        routes = [
+            AIRoute("gemini", "openai", self.gemini_base_url, self.gemini_api_key, self.gemini_model),
+            AIRoute("openrouter", "openai", self.openrouter_base_url, self.openrouter_api_key, self.openrouter_model),
+            AIRoute("radox", self.ai_provider or "openai",
+                    self.ai_base_url, self.ai_api_key, self.ai_model),
+        ]
+        return [r for r in routes if r.api_key and r.model and r.style in ("openai", "anthropic")]
 
     def with_ai_timeout(self, seconds: int) -> Config:
         """Copy of this config with a longer AI timeout (for slow, long-form calls)."""
         return replace(self, ai_timeout=seconds)
 
     def secrets(self) -> list[str]:
-        return [s for s in (self.token, self.ai_api_key) if s]
+        return [s for s in (self.token, self.ai_api_key, self.gemini_api_key, self.openrouter_api_key) if s]
 
     def safe_summary(self) -> dict[str, object]:
         """Non-secret settings for /config and the startup log."""
@@ -179,7 +206,7 @@ class Config:
             },
             "shortlist_size": self.shortlist_size,
             "history_import_enabled": self.history_import_enabled,
-            "ai": f"{self.ai_provider}:{self.ai_model}" if self.ai_enabled else "disabled",
+            "ai": " > ".join(f"{r.name}:{r.model}" for r in self.ai_chain()) or "disabled",
             "owners": len(self.owner_ids),
             "staff_roles": len(self.staff_role_ids),
         }
@@ -342,6 +369,12 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         ai_api_key=get("AI_API_KEY"),
         ai_model=get("AI_MODEL"),
         ai_base_url=get("AI_BASE_URL"),
+        gemini_api_key=get("GEMINI_API_KEY"),
+        gemini_model=get("GEMINI_MODEL") or "gemini-2.5-flash",
+        gemini_base_url=get("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai",
+        openrouter_api_key=get("OPENROUTER_API_KEY"),
+        openrouter_model=get("OPENROUTER_MODEL") or "openai/gpt-4o-mini",
+        openrouter_base_url=get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1",
         ai_timeout=as_int("AI_TIMEOUT_SECONDS", 30, 5, 300),
         ai_max_requests_per_day=as_int("AI_MAX_REQUESTS_PER_DAY", 20, 0, 10000),
         ai_max_messages_per_request=as_int("AI_MAX_MESSAGES_PER_REQUEST", 5, 1, 20),

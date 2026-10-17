@@ -708,7 +708,7 @@ def register_commands(bot: ColddBot) -> None:
         await bot.flush(reason="deep scan saved")
         head = text[:3600] + ("\n…" if len(text) > 3600 else "")
         e = ui.card(f"Deep scan · {today.isoformat()}", head, inter.guild,
-                    footer=f"{cfg.ai_model} · aggregate figures only · full report attached")
+                    footer="AI-written · aggregate figures only · full report attached")
         await inter.followup.send(embed=e, file=text_file(f"coldd-deepscan-{today.isoformat()}.md", text), ephemeral=True)
 
     @tree.command(name="summary", description="AI-written summary of recent activity (staff, aggregate figures only)")
@@ -744,7 +744,7 @@ def register_commands(bot: ColddBot) -> None:
         except ai.AIError as exc:
             log.warning("AI summary failed: %s", ai.redact(str(exc), cfg.secrets()))
             return await inter.followup.send(f"AI summary unavailable ({ai.redact(str(exc), cfg.secrets())}).", ephemeral=True)
-        e = ui.card(f"Summary · last {days} days", text, inter.guild, footer=f"AI-written from aggregate counts · {cfg.ai_model}")
+        e = ui.card(f"Summary · last {days} days", text, inter.guild, footer="AI-written from aggregate counts")
         await inter.followup.send(embed=e, ephemeral=True)
 
     @tree.command(name="audit", description="Run a full analytics audit (staff)")
@@ -907,7 +907,7 @@ def register_commands(bot: ColddBot) -> None:
         rec["ai"] = {**result, "at": now_ts(), "by": str(inter.user.id)}
         bot.collector.dirty = True
         await inter.followup.send(
-            f"**Advisory only** (sent {len(texts)} message(s) to {cfg.ai_provider}/{cfg.ai_model}; this used 1 external API request).\n"
+            f"**Advisory only** (sent {len(texts)} message(s) to an AI provider; this used 1 external API request).\n"
             f"Rating: **{result['rating']}/5**. {result['summary']}\nThis does not change counts or scores.",
             ephemeral=True,
         )

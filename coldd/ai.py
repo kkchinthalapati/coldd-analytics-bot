@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .config import Config
+from .config import AIRoute, Config
 
 log = logging.getLogger("coldd.ai")
 
@@ -105,25 +105,48 @@ def _post(url: str, headers: dict[str, str], body: dict[str, Any], timeout: int)
     raise AIError("AI provider unavailable")
 
 
-def _complete(cfg: Config, system: str, user: str, max_tokens: int = 300) -> str:
-    """One chat completion against the configured provider. Blocking; raises AIError."""
-    if cfg.ai_provider == "anthropic":
-        url = (cfg.ai_base_url or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
-        body = {"model": cfg.ai_model, "max_tokens": max_tokens, "system": system,
+def _call(route: AIRoute, timeout: int, system: str, user: str, max_tokens: int) -> str:
+    """One chat completion on a single route. Blocking; raises AIError."""
+    if route.style == "anthropic":
+        url = (route.base_url or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
+        body = {"model": route.model, "max_tokens": max_tokens, "system": system,
                 "messages": [{"role": "user", "content": user}]}
-        resp = _post(url, {"x-api-key": cfg.ai_api_key, "anthropic-version": "2023-06-01"}, body, cfg.ai_timeout)
+        resp = _post(url, {"x-api-key": route.api_key, "anthropic-version": "2023-06-01"}, body, timeout)
         try:
             return "".join(b.get("text", "") for b in resp["content"] if b.get("type") == "text")
         except (KeyError, TypeError, AttributeError):
             raise AIError("unexpected response shape from provider") from None
-    url = (cfg.ai_base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
-    body = {"model": cfg.ai_model, "max_tokens": max_tokens,
+    url = (route.base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+    body = {"model": route.model, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    resp = _post(url, {"authorization": f"Bearer {cfg.ai_api_key}"}, body, cfg.ai_timeout)
+    resp = _post(url, {"authorization": f"Bearer {route.api_key}"}, body, timeout)
     try:
         return resp["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
         raise AIError("unexpected response shape from provider") from None
+
+
+def _complete(cfg: Config, system: str, user: str, max_tokens: int = 300) -> str:
+    """Try each configured provider in order (Gemini, OpenRouter, Radox). The first usable reply wins.
+
+    A provider that errors, times out or returns an empty reply hands over to the next one.
+    Raises AIError only when every provider has failed.
+    """
+    routes = cfg.ai_chain()
+    if not routes:
+        raise AIError("AI is not configured")
+    failures: list[str] = []
+    for route in routes:
+        try:
+            text = _call(route, cfg.ai_timeout, system, user, max_tokens)
+        except AIError as exc:
+            failures.append(f"{route.name}: {exc}")
+            log.info("AI provider %s failed, trying next: %s", route.name, redact(str(exc), cfg.secrets()))
+            continue
+        if text.strip():
+            return text
+        failures.append(f"{route.name}: empty reply")
+    raise AIError("all AI providers failed (" + "; ".join(failures) + ")")
 
 
 SUMMARY_PROMPT = (
@@ -208,5 +231,5 @@ def assess(cfg: Config, messages: list[str]) -> dict[str, Any]:
     text = _complete(cfg, SYSTEM_PROMPT, user, max_tokens=4000)
     result = parse_response(text)
     result["n"] = min(len(messages), cfg.ai_max_messages_per_request)
-    result["model"] = cfg.ai_model
+    result["model"] = "fallback-chain"  # the provider that answered is not tracked per call
     return result
