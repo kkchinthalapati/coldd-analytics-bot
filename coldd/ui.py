@@ -41,7 +41,7 @@ def banner_url() -> str:
 def logo(guild: discord.Guild | None) -> str:
     """The server's :colddlogo: emoji, or a plain fallback if the server doesn't have it."""
     if guild is not None:
-        for emoji in guild.emojis:
+        for emoji in getattr(guild, "emojis", []) or []:
             if emoji.name == LOGO_EMOJI_NAME:
                 return str(emoji)
     return "◆"

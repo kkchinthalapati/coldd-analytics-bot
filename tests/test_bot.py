@@ -79,23 +79,14 @@ def test_expected_commands_registered(bot):
 
 
 @pytest.mark.parametrize("name,kwargs", [
-    ("audit", {"days": 30}), ("analytics", {"days": 7}), ("health", {}), ("config", {}),
-    ("channels", {"days": 7}),
+    ("health", {}), ("config", {}), ("channels", {"days": 7}),
 ])
-def test_staff_commands_reject_regular_members(bot, name, kwargs):
+def test_commands_run_without_role_or_owner_gate(bot, name, kwargs):
+    """Access is controlled by Discord's integration settings, not by checks in the bot."""
     inter = interaction(2)
     asyncio.run(bot.tree.get_command(name).callback(inter, **kwargs))
-    content, kw = inter.response.sent[0]
-    assert "restricted" in content and kw["ephemeral"]
-
-
-def test_owner_only_commands(bot):
-    inter = interaction(2)
-    asyncio.run(bot.tree.get_command("forget").callback(inter, user=SimpleNamespace(id=5), confirm=True))
-    assert "restricted to the owner" in inter.response.sent[0][0]
-    inter = interaction(2)
-    asyncio.run(bot.tree.get_command("export").callback(inter, kind="data", days=30, week=-1))
-    assert "restricted to the owner" in inter.response.sent[0][0]
+    assert inter.response.sent, "command produced no response"
+    assert "restricted" not in str(inter.response.sent[0][0])
 
 
 def test_owner_can_run_reports_ephemerally(bot):

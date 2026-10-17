@@ -458,10 +458,6 @@ def text_file(name: str, content: str | bytes) -> discord.File:
     return discord.File(io.BytesIO(raw), filename=name)
 
 
-async def deny(inter: discord.Interaction, what: str = "staff") -> None:
-    await inter.response.send_message(f"This command is restricted to {what}.", ephemeral=True)
-
-
 def today_for(cfg: Config) -> date:
     return to_local(now_ts(), cfg.tz).date()
 
@@ -471,7 +467,7 @@ def clamp_days(days: int, cfg: Config) -> int:
 
 
 def register_commands(bot: ColddBot) -> None:
-    cfg, tree, access = bot.cfg, bot.tree, bot.access
+    cfg, tree = bot.cfg, bot.tree
     data = lambda: bot.store.data  # noqa: E731 - always the live dataset
 
     @tree.error
@@ -518,8 +514,6 @@ def register_commands(bot: ColddBot) -> None:
     @tree.command(name="analytics", description="Server activity summary")
     @app_commands.describe(days="Number of days (default 7)")
     async def analytics_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         days = clamp_days(days, cfg)
         s = analytics.summary(data(), cfg, days, today_for(cfg))
         cov = s["coverage"]
@@ -598,8 +592,6 @@ def register_commands(bot: ColddBot) -> None:
     async def profile_cmd(inter: discord.Interaction, member: discord.Member | None = None,
                           days: app_commands.Range[int, 1, 90] = 30) -> None:
         target = member or inter.user
-        if target.id != inter.user.id and not access.is_staff(inter):
-            return await deny(inter, "staff (you can view your own profile)")
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         p = analytics.member_profile(data(), cfg, str(target.id), days, today_for(cfg))
         if p is None:
@@ -624,8 +616,6 @@ def register_commands(bot: ColddBot) -> None:
     @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention (staff)")
     @app_commands.describe(days="Number of days (default 30)")
     async def insights_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         days = clamp_days(days, cfg)
         today = today_for(cfg)
         ins = analytics.insights(data(), cfg, days, today)
@@ -676,8 +666,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="deepscan", description="Deep AI analysis of every aggregate metric (staff, slow, rate-limited)")
     async def deepscan_cmd(inter: discord.Interaction) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         if not cfg.ai_enabled:
             return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
         meta = data()["meta"]
@@ -714,8 +702,6 @@ def register_commands(bot: ColddBot) -> None:
     @tree.command(name="summary", description="AI-written summary of recent activity (staff, aggregate figures only)")
     @app_commands.describe(days="Number of days (default 7)")
     async def summary_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         if not cfg.ai_enabled:
             return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
         today = today_for(cfg).isoformat()
@@ -750,8 +736,6 @@ def register_commands(bot: ColddBot) -> None:
     @tree.command(name="audit", description="Run a full analytics audit (staff)")
     @app_commands.describe(days="Number of days to audit (default 30)")
     async def audit_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         await inter.response.defer(ephemeral=True, thinking=True)
         days = clamp_days(days, cfg)
         report, fig = analytics.run_audit(data(), cfg, days, today_for(cfg))
@@ -770,8 +754,6 @@ def register_commands(bot: ColddBot) -> None:
     @weekly.command(name="show", description="Generate the Member of the Week shortlist")
     @app_commands.describe(week="0 = current week, -1 = last week, -2 = two weeks ago…")
     async def weekly_show(inter: discord.Interaction, week: app_commands.Range[int, -52, 0] = 0) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         await inter.response.defer(ephemeral=True, thinking=True)
         r = week_result(week)
         rows = r["shortlist"]
@@ -814,8 +796,6 @@ def register_commands(bot: ColddBot) -> None:
                            replace="Replace an already recorded winner")
     async def weekly_approve(inter: discord.Interaction, member: discord.Member,
                              week: app_commands.Range[int, -52, 0] = -1, note: str = "", replace: bool = False) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         r = week_result(week)
         ok, msg = scoring.approve_winner(data(), cfg, r, member.id, inter.user.id, note, replace)
         if ok:
@@ -826,8 +806,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @weekly.command(name="paid", description="Mark a recorded award as paid out")
     async def weekly_paid(inter: discord.Interaction, week: app_commands.Range[int, -52, 0] = -1) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         wk = scoring.resolve_week(cfg, today_for(cfg), week).isoformat()
         award = data()["awards"].get(wk)
         if not award:
@@ -841,8 +819,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @weekly.command(name="history", description="Previous Member of the Week decisions")
     async def weekly_history(inter: discord.Interaction) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         rows = sorted(data()["awards"].items(), reverse=True)[:25]
         lines = [f"`{wk}` <@{a['winner']}> · {a.get('amount')} {a.get('currency')} · "
                  f"{'paid' if a.get('paid') else 'unpaid'} · by <@{a.get('approved_by')}>" for wk, a in rows]
@@ -853,8 +829,6 @@ def register_commands(bot: ColddBot) -> None:
     @app_commands.describe(member="Member to nominate", reason="Short reason (stored)", week="0 = current week")
     async def weekly_nominate(inter: discord.Interaction, member: discord.Member, reason: str,
                               week: app_commands.Range[int, -52, 0] = 0) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         if member.bot:
             return await inter.response.send_message("Bots cannot be nominated.", ephemeral=True)
         wk = scoring.resolve_week(cfg, today_for(cfg), week).isoformat()
@@ -867,8 +841,6 @@ def register_commands(bot: ColddBot) -> None:
     @app_commands.describe(member="Candidate", message_links="Message links separated by spaces", week="0 = current week")
     async def weekly_ai(inter: discord.Interaction, member: discord.Member, message_links: str,
                         week: app_commands.Range[int, -52, 0] = 0) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         if not cfg.ai_enabled:
             return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL). "
                                                      "Deterministic scoring works without it.", ephemeral=True)
@@ -919,8 +891,6 @@ def register_commands(bot: ColddBot) -> None:
     @app_commands.choices(metric=[app_commands.Choice(name=v[0], value=k) for k, v in analytics.METRICS.items()])
     async def leaderboard_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7,
                               metric: str = "messages") -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         rows = analytics.leaderboard(data(), cfg, days, today_for(cfg), metric, limit=20)
         label = analytics.METRICS[metric][0]
@@ -933,8 +903,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="channels", description="Channel activity analysis")
     async def channels_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         days = clamp_days(days, cfg)
         rows = [r for r in analytics.channel_stats(data(), cfg, days, today_for(cfg)) if r["messages"] or r["prev"]][:25]
         top = rows[0]["messages"] if rows else 0
@@ -950,8 +918,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="member", description="A member's stored aggregate statistics")
     async def member_cmd(inter: discord.Interaction, user: discord.User, days: app_commands.Range[int, 1, 365] = 30) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         st = analytics.member_stats(data(), cfg, user.id, days, today_for(cfg))
         if st is None:
@@ -975,8 +941,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="health", description="Collection coverage, uptime and storage status")
     async def health_cmd(inter: discord.Interaction) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         h, tz = bot.health(), cfg.tz
         lines = [
             f"**Version:** {h['version']} · **Connected:** {'yes' if h['connected'] else 'no'} · **Latency:** {h['latency_ms']} ms",
@@ -1006,11 +970,6 @@ def register_commands(bot: ColddBot) -> None:
     ])
     async def export_cmd(inter: discord.Interaction, kind: str, days: app_commands.Range[int, 1, 365] = 30,
                          week: app_commands.Range[int, -52, 0] = -1) -> None:
-        if kind == "data":
-            if not access.is_owner(inter):
-                return await deny(inter, "the owner")
-        elif not access.is_staff(inter):
-            return await deny(inter)
         await inter.response.defer(ephemeral=True, thinking=True)
         days = clamp_days(days, cfg)
         today = today_for(cfg)
@@ -1059,8 +1018,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="config", description="Show non-secret configuration")
     async def config_cmd(inter: discord.Interaction) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter)
         lines = [f"**{k}:** {v}" for k, v in cfg.safe_summary().items()]
         await inter.response.send_message(embed=embed("Configuration (secrets hidden)", "\n".join(lines)), ephemeral=True)
 
@@ -1116,8 +1073,6 @@ def register_commands(bot: ColddBot) -> None:
                            days="How far back (max = member retention)")
     async def import_cmd(inter: discord.Interaction, channel: discord.TextChannel | None = None,
                          days: app_commands.Range[int, 1, 365] = 90) -> None:
-        if not access.is_staff(inter):
-            return await deny(inter, "staff")
         if not cfg.history_import_enabled:
             return await inter.response.send_message("History import is disabled. Set HISTORY_IMPORT_ENABLED=true to allow it.",
                                                      ephemeral=True)
@@ -1137,8 +1092,6 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="forget", description="Owner: delete a member's stored statistics (privacy request)")
     async def forget_cmd(inter: discord.Interaction, user: discord.User, confirm: bool = False) -> None:
-        if not access.is_owner(inter):
-            return await deny(inter, "the owner")
         if not confirm:
             return await inter.response.send_message("Re-run with `confirm: True` to permanently delete this member's statistics.",
                                                      ephemeral=True)
