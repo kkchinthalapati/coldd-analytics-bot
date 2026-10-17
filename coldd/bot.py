@@ -1111,13 +1111,13 @@ def register_commands(bot: ColddBot) -> None:
             log.warning("Could not post the import report in the invoking channel; see logs for totals.")
             log.info("History import finished: %s; failed: %s", totals, failed)
 
-    @tree.command(name="import_history", description="Owner: import past messages for one channel, or every readable channel")
+    @tree.command(name="import_history", description="Staff: import past messages for one channel, or every readable channel")
     @app_commands.describe(channel="One channel (leave empty for every channel the bot can read)",
                            days="How far back (max = member retention)")
     async def import_cmd(inter: discord.Interaction, channel: discord.TextChannel | None = None,
                          days: app_commands.Range[int, 1, 365] = 90) -> None:
-        if not access.is_owner(inter):
-            return await deny(inter, "the owner")
+        if not access.is_staff(inter):
+            return await deny(inter, "staff")
         if not cfg.history_import_enabled:
             return await inter.response.send_message("History import is disabled. Set HISTORY_IMPORT_ENABLED=true to allow it.",
                                                      ephemeral=True)
