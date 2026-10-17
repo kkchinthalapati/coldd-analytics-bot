@@ -1026,11 +1026,29 @@ def register_commands(bot: ColddBot) -> None:
         lines = [f"**{k}:** {v}" for k, v in cfg.safe_summary().items()]
         await inter.response.send_message(embed=embed("Configuration (secrets hidden)", "\n".join(lines)), ephemeral=True)
 
-    def readable_targets(guild: discord.Guild) -> list[Any]:
-        """Every text channel and active thread the bot can read and that isn't excluded by configuration."""
+    async def readable_targets(guild: discord.Guild) -> list[Any]:
+        """Every place people can post that the bot can read and that isn't excluded by configuration:
+        text channels, voice-channel text chats, stage text, forum posts, and active and archived threads."""
         me = guild.me
+        candidates: list[Any] = [
+            ch for ch in guild.channels
+            if isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel))
+        ]
+        candidates += list(guild.threads)
+        for ch in [c for c in candidates if isinstance(c, (discord.TextChannel, discord.ForumChannel))]:
+            if not ch.permissions_for(me).read_message_history:
+                continue
+            try:
+                async for thread in ch.archived_threads(limit=None):
+                    candidates.append(thread)
+            except discord.HTTPException:
+                log.warning("Could not list archived threads in %s", ch.id)
+        seen: set[int] = set()
         out: list[Any] = []
-        for ch in [*guild.text_channels, *guild.threads]:
+        for ch in candidates:
+            if ch.id in seen or isinstance(ch, discord.ForumChannel):
+                continue
+            seen.add(ch.id)
             perms = ch.permissions_for(me)
             if not (perms.view_channel and perms.read_message_history):
                 continue
@@ -1101,14 +1119,15 @@ def register_commands(bot: ColddBot) -> None:
         if bot._import_running:
             return await inter.response.send_message("An import is already running.", ephemeral=True)
         days = min(days, cfg.member_retention_days)
-        targets = [channel] if channel else readable_targets(inter.guild)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        targets = [channel] if channel else await readable_targets(inter.guild)
         if not targets:
-            return await inter.response.send_message("The bot can't read any channels to import.", ephemeral=True)
+            return await inter.followup.send("The bot can't read any channels to import.", ephemeral=True)
         bot._import_running = True
         # The import can run for a long time, longer than Discord allows for a reply, so it runs in the background
         # and the report is posted to the channel where the command was run.
         asyncio.create_task(run_import(inter, targets, days))
-        await inter.response.send_message(
+        await inter.followup.send(
             f"Importing {days} days from {len(targets)} channel(s) in the background. "
             f"The report will be posted here when it finishes.", ephemeral=True)
 
