@@ -25,6 +25,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from . import recount
+from .collector import scored_counts
 from .config import Config
 from .scoring import resolve_week, score_week
 from .timeutil import day_start_ts, days_back, fmt_ts, now_ts, week_start
@@ -357,6 +358,8 @@ COMMUNITY_METRICS: dict[str, tuple[str, str, Any]] = {
                      lambda a: a["r"] + a["rg"] + a["rx"]),
     "helpful": ("Most helpful (replies and reactions received)", "points", lambda a: a["r"] + a["rx"]),
     "voice": ("Most voice time", "min", lambda a: round(a["v"] / 60)),
+    "conversation": ("Most conversational (different people talked with)", "people", lambda a: a["partners"]),
+    "presence": ("Most present (hours of the day active)", "hours", lambda a: a["presence"]),
 }
 
 
@@ -367,19 +370,22 @@ def member_table(data: dict[str, Any], cfg: Config, days_n: int, today: date) ->
     agg: dict[str, dict[str, Any]] = {}
     run: dict[str, int] = {}
     best: dict[str, int] = {}
+    partner_sets: dict[str, set[int]] = {}
     for day in days:
         users = data["days"].get(day, {}).get("u", {})
         active_today = set()
         for uid, rec in users.items():
-            if rec.get("m", 0) > 0:
+            sm, sd, sb, sr = scored_counts(rec, cfg)  # only scored channels when a scope is configured
+            if sm > 0:
                 active_today.add(uid)
-            a = agg.setdefault(uid, {"eff": 0, "m": 0, "days": 0, "streak": 0, "r": 0, "rx": 0, "rg": 0, "v": 0})
-            m = rec.get("m", 0)
-            a["m"] += m
-            excl = sum(n for cid, n in rec.get("c", {}).items() if int(cid) in cfg.score_exclude_channel_ids)
-            a["eff"] += min(max(0, m - rec.get("d", 0) - rec.get("b", 0) - excl), cfg.daily_message_cap)
-            a["days"] += 1 if m > 0 else 0
-            a["r"] += min(rec.get("r", 0), cfg.daily_reply_cap)
+            a = agg.setdefault(uid, {"eff": 0, "m": 0, "days": 0, "streak": 0, "r": 0, "rx": 0, "rg": 0, "v": 0,
+                                     "partners": 0, "presence": 0})
+            a["m"] += rec.get("m", 0)  # everything they sent, for comparison with Discord's own search
+            a["eff"] += min(max(0, sm - sd - sb), cfg.daily_message_cap)
+            a["days"] += 1 if sm > 0 else 0
+            partner_sets.setdefault(uid, set()).update(rec.get("pp", ()))
+            a["presence"] += bin(rec.get("sh", 0)).count("1")
+            a["r"] += min(sr, cfg.daily_reply_cap)
             a["rx"] += min(rec.get("rx", 0), cfg.daily_reaction_cap)
             a["rg"] += min(rec.get("rg", 0), cfg.daily_reaction_cap)
             a["v"] += rec.get("v", 0)
@@ -391,6 +397,7 @@ def member_table(data: dict[str, Any], cfg: Config, days_n: int, today: date) ->
             best[uid] = max(best.get(uid, 0), run[uid])
     for uid, a in agg.items():
         a["streak"] = best.get(uid, 0)
+        a["partners"] = len(partner_sets.get(uid, ()))
         a["window_days"] = len(days)
     return {uid: a for uid, a in agg.items() if is_human(data, uid)}
 
@@ -460,6 +467,8 @@ def deep_stats(data: dict[str, Any], cfg: Config, today: date) -> dict[str, Any]
             "days_verified_against_discord": len(recount.verified_days(data, window_days)), "window_days": w,
             "distribution_reactions_given": dist("rg"), "distribution_replies_sent": dist("r"),
             "distribution_active_days": dist("days"), "distribution_longest_streak": dist("streak"),
+            "distribution_conversation_partners": dist("partners"), "distribution_active_hours": dist("presence"),
+            "scoring_scope": ("general chat and ticket channels" if cfg.score_scope_active else "all channels"),
             "messages": s["messages"], "messages_previous": s["messages_prev"],
             "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
             "returning_members": s["returning"],
@@ -806,11 +815,14 @@ def weekly_markdown(result: dict[str, Any], cfg: Config) -> str:
         L.append("")
     L.append("Weights used (after redistribution): " + ", ".join(f"{k} {v:.0%}" for k, v in result["weights"].items()) + "\n")
     L.append(md_table(
-        ["Rank", "Member", "Score", "Particip.", "Consist.", "Helpful", "Extra", "Eff. msgs", "Days", "Replies", "Reacts", "Noms", "Voice min", "Flags"],
+        ["Rank", "Member", "Score", "Particip.", "Consist.", "Helpful", "Extra", "Convers.", "Presence", "Eff. msgs", "Days",
+         "People", "Hours", "Replies", "Reacts", "Noms", "Voice min", "Flags"],
         [(f"{r['rank']}{' (tie)' if r['tie'] else ''}", f"{r['name']} ({r['uid']})", f"{r['score']:.1f}",
           r["components"].get("participation", "-"), r["components"].get("consistency", "-"),
           r["components"].get("helpfulness", "-"), r["components"].get("extra", "-"),
-          r["effective_messages"], r["active_days"], r["replies"], r["reactions"], r["nominations"],
+          r["components"].get("conversation", "-"), r["components"].get("presence", "-"),
+          r["effective_messages"], r["active_days"], r["partners"], r["presence_hours"],
+          r["replies"], r["reactions"], r["nominations"],
           round(r["voice_minutes"]), "; ".join(r["flags"]) or "")
          for r in result["shortlist"]],
     ))
@@ -826,6 +838,9 @@ def weekly_markdown(result: dict[str, Any], cfg: Config) -> str:
     L.append("\n## How the score is calculated\n")
     L.append("participation = sqrt(effective messages) / sqrt(best); consistency = active days / days elapsed; "
              "helpfulness = (capped replies + 0.5 x capped reactions received + nomination weight x nominations) / best; "
-             "extra = sqrt(voice minutes) / sqrt(best). Unavailable components have their weight redistributed. "
-             "Duplicate and burst messages are excluded before capping.")
+             "extra = average of sqrt(voice minutes) / sqrt(best) and sqrt(reactions given) / sqrt(best); "
+             "conversation = sqrt(distinct people they replied to, mentioned or were replied to) / sqrt(best); "
+             "presence = sqrt(distinct hours of the day they were active, summed over the week) / sqrt(best). "
+             "Unavailable components have their weight redistributed. Duplicate and burst messages are excluded "
+             "before capping. When a scoring scope is configured, only messages in the scored channels count.")
     return "\n".join(L)

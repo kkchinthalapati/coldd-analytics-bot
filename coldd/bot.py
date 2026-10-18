@@ -244,15 +244,17 @@ class ColddBot(discord.Client):
         ref = message.reference.resolved if message.reference else None
         reply_to_other = isinstance(ref, discord.Message) and ref.author.id != author.id and not ref.author.bot
         fp = content_fingerprint(message.content) if message.content else None
+        # Record the channel's name first: whether a message is scored can depend on it (e.g. "ticket-" channels).
+        ch = message.channel.parent if isinstance(message.channel, discord.Thread) and message.channel.parent else message.channel
+        ch_name = getattr(ch, "name", None)
+        if ch_name:
+            self.collector.note_channel(count_id, ch_name)
         self.collector.record_message(
             author.id, count_id, int(message.created_at.timestamp()),
             name=getattr(author, "display_name", None) or author.name,
             is_bot=is_bot, fingerprint=fp, reply_to_other=reply_to_other,
-            excluded_role=excluded, message_id=message.id,
+            excluded_role=excluded, message_id=message.id, partners=self._partners(message),
         )
-        if getattr(message.channel, "name", None):
-            ch = message.channel.parent if isinstance(message.channel, discord.Thread) and message.channel.parent else message.channel
-            self.collector.note_channel(count_id, getattr(ch, "name", None))
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if payload.guild_id == self.cfg.guild_id:
@@ -331,7 +333,27 @@ class ColddBot(discord.Client):
                 out.append(ch)
         return out
 
-    async def _to_msg(self, m: discord.Message, count_id: int, with_reactions: bool, warnings: list[int]) -> recount.Msg | None:
+    @staticmethod
+    def _partners(message: discord.Message) -> tuple[int, ...]:
+        """Distinct humans this message is directed at: the author it replies to and anyone mentioned."""
+        author = message.author
+        if author.bot or message.webhook_id is not None:
+            return ()
+        found: set[int] = set()
+        ref = message.reference.resolved if message.reference else None
+        if isinstance(ref, discord.Message) and not ref.author.bot and ref.author.id != author.id:
+            found.add(ref.author.id)
+        for user in getattr(message, "mentions", ()):
+            if not user.bot and user.id != author.id:
+                found.add(user.id)
+        return tuple(found)
+
+    def _channel_scored(self, ch: Any, count_id: int) -> bool:
+        parent = ch.parent if isinstance(ch, discord.Thread) else None
+        return self.collector.is_scored(count_id, (parent.name if parent else getattr(ch, "name", None)))
+
+    async def _to_msg(self, m: discord.Message, count_id: int, scored: bool, with_reactions: bool,
+                      warnings: list[int]) -> recount.Msg | None:
         """Turn a history message into the compact record the rebuild needs (message text is not kept)."""
         if m.is_system():
             return None
@@ -350,7 +372,8 @@ class ColddBot(discord.Client):
                 except discord.HTTPException:
                     warnings[0] += 1  # this message's reactions may be incomplete
         return recount.Msg(int(m.created_at.timestamp()), author.id, count_id, fp, reply,
-                           getattr(author, "display_name", None) or author.name, is_bot, tuple(reactors))
+                           getattr(author, "display_name", None) or author.name, is_bot, tuple(reactors),
+                           scored, self._partners(m))
 
     async def rebuild_history(self, days: int, reactions: bool = True,
                               progress: Callable[[int, int, int], Awaitable[None]] | None = None) -> dict[str, Any]:
@@ -385,9 +408,10 @@ class ColddBot(discord.Client):
             failed = False
             for ch in targets:
                 count_id, _ = self._resolve_channel(ch)
+                scored = self._channel_scored(ch, count_id)
                 try:
                     async for m in ch.history(after=after, before=before, limit=None, oldest_first=True):
-                        rec = await self._to_msg(m, count_id, reactions, warnings)
+                        rec = await self._to_msg(m, count_id, scored, reactions, warnings)
                         if rec is not None:
                             msgs.append(rec)
                             read += 1
@@ -681,6 +705,8 @@ def register_commands(bot: ColddBot) -> None:
         e.add_field(name="🤝 Interactions", value=f"**{f['r'] + f['rg'] + f['rx']:,}** · {place('interactions')}", inline=True)
         e.add_field(name="⭐ Helpful", value=f"replies {f['r']} · reactions received {f['rx']} · {place('helpful')}", inline=True)
         e.add_field(name="🎙️ Voice", value=f"**{round(f['v'] / 60)} min** · {place('voice')}", inline=True)
+        e.add_field(name="💬 Talks with", value=f"**{f['partners']}** different people · {place('conversation')}", inline=True)
+        e.add_field(name="🕒 Present", value=f"**{f['presence']}** active hours · {place('presence')}", inline=True)
         await inter.response.send_message(embed=e, ephemeral=True)
 
     @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention")
@@ -809,7 +835,8 @@ def register_commands(bot: ColddBot) -> None:
             e.add_field(name=f"{ui.medal(row['rank'])} {tie.strip() or 'Rank ' + str(row['rank'])}{flag}",
                         value=f"<@{row['uid']}>\n**{row['score']:.1f}** pts\n"
                               f"{row['effective_messages']} msgs · {row['active_days']}d\n"
-                              f"{row['replies']} replies · {row['reactions']} ❤ · {row['nominations']} noms",
+                              f"{row['replies']} replies · {row['reactions']} ❤ · {row['nominations']} noms\n"
+                              f"talks with {row['partners']} people · active {row['presence_hours']}h",
                         inline=True)
         if rows[3:]:
             table = ["rank  score  msgs  days  r/❤   noms"]

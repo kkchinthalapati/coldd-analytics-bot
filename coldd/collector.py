@@ -28,7 +28,8 @@ from .timeutil import day_key, local_hour, now_ts
 log = logging.getLogger("coldd.collector")
 
 MAX_GAPS = 500
-F_DUP, F_BURST, F_REPLY, F_IMPORTED = 1, 2, 4, 8
+F_DUP, F_BURST, F_REPLY, F_IMPORTED, F_SCORED = 1, 2, 4, 8, 16
+PARTNER_MASK = 0x7FFFFFFF  # partners are stored as 31-bit ids: only distinct counts matter, and it keeps the file small
 _WS = re.compile(r"\s+")
 
 
@@ -46,6 +47,18 @@ def inc(rec: dict[str, Any], key: str, n: int | float = 1) -> None:
         rec.pop(key, None)
     else:
         rec[key] = value
+
+
+def scored_counts(rec: dict[str, Any], cfg: Config) -> tuple[int, int, int, int]:
+    """(messages, duplicates, bursts, replies) that count toward scoring for one member-day.
+
+    With a scoring scope configured, only messages in scored channels count (stored as sm/sd/sb/sr). Records
+    written before the scope existed carry no ``sv`` marker; they fall back to all-channel values until
+    ``/import_history`` rebuilds that day, so nothing silently drops to zero.
+    """
+    if cfg.score_scope_active and rec.get("sv"):
+        return rec.get("sm", 0), rec.get("sd", 0), rec.get("sb", 0), rec.get("sr", 0)
+    return rec.get("m", 0), rec.get("d", 0), rec.get("b", 0), rec.get("r", 0)
 
 
 class SpamTracker:
@@ -146,6 +159,18 @@ class Collector:
             return False
         return True
 
+    def is_scored(self, channel_id: int, name: str | None = None) -> bool:
+        """Whether messages in this channel count toward scoring (everything does when no scope is configured)."""
+        cfg = self.cfg
+        if not cfg.score_scope_active:
+            return True
+        if channel_id in cfg.score_channel_ids:
+            return True
+        if name is None:
+            name = self.data["channels"].get(str(channel_id), {}).get("n", "")
+        name = (name or "").lower()
+        return any(name.startswith(prefix) for prefix in cfg.score_channel_prefixes)
+
     def note_channel(self, cid: int, name: str | None) -> None:
         if not name:
             return
@@ -185,6 +210,8 @@ class Collector:
         message_id: int | None = None,
         imported: bool = False,
         flags_override: tuple[bool, bool] | None = None,
+        scored: bool | None = None,
+        partners: tuple[int, ...] = (),
     ) -> int:
         """Count one qualifying message. Returns the flag bits applied."""
         day = day_key(ts, self.tz)
@@ -203,9 +230,13 @@ class Collector:
             dup, burst = flags_override
         else:
             dup, burst = self.spam.check(uid, ts, fingerprint)
+        if scored is None:
+            scored = self.is_scored(channel_id)
         flags = (F_DUP if dup else 0) | (F_BURST if burst else 0) | (F_REPLY if reply_to_other else 0)
         if imported:
             flags |= F_IMPORTED
+        if scored:
+            flags |= F_SCORED
 
         rec = self.user_day(day, uid)
         inc(rec, "m")
@@ -223,6 +254,30 @@ class Collector:
         chans = rec.setdefault("c", {})
         cid = str(channel_id)
         chans[cid] = chans.get(cid, 0) + 1
+
+        # Scoring signals. With a scope configured, sm/sd/sb/sr mirror m/d/b/r for scored channels only.
+        if self.cfg.score_scope_active:
+            rec["sv"] = 1
+            if scored:
+                inc(rec, "sm")
+                if dup:
+                    inc(rec, "sd")
+                if burst:
+                    inc(rec, "sb")
+                if reply_to_other:
+                    inc(rec, "sr")
+        if scored:
+            rec["sh"] = rec.get("sh", 0) | (1 << hour)  # hours of the day in which they were active
+            if partners:
+                mine = PARTNER_MASK & uid
+                pp = rec.setdefault("pp", [])
+                for other in partners:
+                    token = PARTNER_MASK & other
+                    if token not in pp:
+                        pp.append(token)
+                    theirs = self.user_day(day, other).setdefault("pp", [])  # the interaction counts for both people
+                    if mine not in theirs:
+                        theirs.append(mine)
 
         inc(srv, "m")
         hours = srv.get("h")
@@ -255,6 +310,14 @@ class Collector:
                 inc(urec, "b", -1)
             if flags & F_REPLY:
                 inc(urec, "r", -1)
+            if self.cfg.score_scope_active and flags & F_SCORED:
+                inc(urec, "sm", -1)
+                if flags & F_DUP:
+                    inc(urec, "sd", -1)
+                if flags & F_BURST:
+                    inc(urec, "sb", -1)
+                if flags & F_REPLY:
+                    inc(urec, "sr", -1)
             chans = urec.get("c", {})
             if chans.get(cid, 0) > 1:
                 chans[cid] -= 1

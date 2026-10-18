@@ -22,7 +22,8 @@ from .config import Config
 from .timeutil import day_key
 
 # Per-member, per-day fields that come from messages and reactions (voice "v"/"vs" is not touched).
-USER_FIELDS = ("m", "d", "b", "r", "i", "c", "rx", "rg")
+# "sm/sd/sb/sr/sv" are the scored-channel mirrors, "sh" the hours active and "pp" the conversation partners.
+USER_FIELDS = ("m", "d", "b", "r", "i", "c", "rx", "rg", "sm", "sd", "sb", "sr", "sv", "sh", "pp")
 # Per-day server fields that come from messages.
 SERVER_FIELDS = ("m", "bm", "d", "b", "im", "h", "ch")
 
@@ -36,6 +37,8 @@ class Msg(NamedTuple):
     name: str | None
     is_bot: bool
     reactors: tuple[int, ...] = ()  # distinct human reactors, excluding the author
+    scored: bool = True  # posted in a channel that counts toward scoring
+    partners: tuple[int, ...] = ()  # distinct humans they replied to or mentioned, excluding themselves
 
 
 def last_complete_days(today: date, n: int) -> list[str]:
@@ -101,7 +104,7 @@ def rebuild_days(data: dict[str, Any], cfg: Config, msgs: list[Msg], days: list[
         if day not in day_set:
             continue
         col.record_message(m.uid, m.cid, m.ts, name=m.name, is_bot=m.is_bot, fingerprint=m.fp,
-                           reply_to_other=m.reply, excluded_role=False)
+                           reply_to_other=m.reply, excluded_role=False, scored=m.scored, partners=m.partners)
         counted += 1
         if cfg.reactions_enabled and m.reactors and not (m.is_bot and not cfg.count_bots):
             inc(col.user_day(day, m.uid), "rx", len(m.reactors))

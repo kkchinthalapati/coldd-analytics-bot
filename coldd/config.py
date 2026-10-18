@@ -41,10 +41,12 @@ def load_dotenv(path: Path) -> None:
 
 @dataclass
 class Weights:
-    participation: float = 0.50
-    consistency: float = 0.20
-    helpfulness: float = 0.20
-    extra: float = 0.10
+    participation: float = 0.30  # how much they chat (square-root dampened)
+    consistency: float = 0.15    # how many days they are active
+    helpfulness: float = 0.15    # replies, reactions received, staff nominations
+    extra: float = 0.10          # voice time and reactions given
+    conversation: float = 0.20   # how many different people they talk with (hard to farm by posting alone)
+    presence: float = 0.10       # how many different hours they are active (bursts do not count as continuous)
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -52,6 +54,8 @@ class Weights:
             "consistency": self.consistency,
             "helpfulness": self.helpfulness,
             "extra": self.extra,
+            "conversation": self.conversation,
+            "presence": self.presence,
         }
 
 
@@ -94,9 +98,11 @@ class Config:
     include_channel_ids: set[int] = field(default_factory=set)
     exclude_channel_ids: set[int] = field(default_factory=set)
     exclude_role_ids: set[int] = field(default_factory=set)
-    # Channels (or categories) that are counted in analytics but earn nothing toward Member of the Week and the
-    # /top message board, e.g. counting or spam channels that would otherwise reward volume over contribution.
-    score_exclude_channel_ids: set[int] = field(default_factory=set)
+    # Scoring scope. When either is set, only these channels count toward Member of the Week and the /top boards
+    # (everything is still counted in analytics): channel IDs, plus channels whose name starts with a prefix
+    # (e.g. "ticket-", "closed-" for tickets, which are created and renamed dynamically).
+    score_channel_ids: set[int] = field(default_factory=set)
+    score_channel_prefixes: tuple[str, ...] = ()
     count_bots: bool = False
 
     message_content_intent: bool = True
@@ -156,6 +162,10 @@ class Config:
     def ai_enabled(self) -> bool:
         return bool(self.ai_chain())
 
+    @property
+    def score_scope_active(self) -> bool:
+        return bool(self.score_channel_ids or self.score_channel_prefixes)
+
     def ai_chain(self) -> list[AIRoute]:
         """Providers to try, in order. A route is included only when its key and model are set."""
         routes = [
@@ -210,7 +220,7 @@ class Config:
             "shortlist_size": self.shortlist_size,
             "history_import_enabled": self.history_import_enabled,
             "auto_recount_days": self.auto_recount_days,
-            "score_exclude_channels": len(self.score_exclude_channel_ids),
+            "score_scope": {"channels": len(self.score_channel_ids), "name_prefixes": list(self.score_channel_prefixes)},
             "ai": " > ".join(f"{r.name}:{r.model}" for r in self.ai_chain()) or "disabled",
             "owners": len(self.owner_ids),
             "staff_roles": len(self.staff_role_ids),
@@ -304,10 +314,12 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         wsd_raw = "monday"
 
     weights = Weights(
-        participation=as_float("WEIGHT_PARTICIPATION", 0.50, 0, 1),
-        consistency=as_float("WEIGHT_CONSISTENCY", 0.20, 0, 1),
-        helpfulness=as_float("WEIGHT_HELPFULNESS", 0.20, 0, 1),
+        participation=as_float("WEIGHT_PARTICIPATION", 0.30, 0, 1),
+        consistency=as_float("WEIGHT_CONSISTENCY", 0.15, 0, 1),
+        helpfulness=as_float("WEIGHT_HELPFULNESS", 0.15, 0, 1),
         extra=as_float("WEIGHT_EXTRA", 0.10, 0, 1),
+        conversation=as_float("WEIGHT_CONVERSATION", 0.20, 0, 1),
+        presence=as_float("WEIGHT_PRESENCE", 0.10, 0, 1),
     )
     if sum(weights.as_dict().values()) <= 0:
         problems.append("At least one WEIGHT_* setting must be greater than zero.")
@@ -342,7 +354,8 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         inactive_member_retention_days=as_int("INACTIVE_MEMBER_RETENTION_DAYS", 120, 14, 3650),
         include_channel_ids=_ids(get("INCLUDE_CHANNEL_IDS"), "INCLUDE_CHANNEL_IDS", problems),
         exclude_channel_ids=_ids(get("EXCLUDE_CHANNEL_IDS"), "EXCLUDE_CHANNEL_IDS", problems),
-        score_exclude_channel_ids=_ids(get("SCORE_EXCLUDE_CHANNEL_IDS"), "SCORE_EXCLUDE_CHANNEL_IDS", problems),
+        score_channel_ids=_ids(get("SCORE_CHANNEL_IDS"), "SCORE_CHANNEL_IDS", problems),
+        score_channel_prefixes=tuple(x.strip().lower() for x in get("SCORE_CHANNEL_PREFIXES").split(",") if x.strip()),
         exclude_role_ids=_ids(get("EXCLUDE_ROLE_IDS"), "EXCLUDE_ROLE_IDS", problems),
         count_bots=as_bool("COUNT_BOTS", False),
         message_content_intent=as_bool("MESSAGE_CONTENT_INTENT", True),

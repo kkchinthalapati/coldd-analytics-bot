@@ -9,7 +9,7 @@ def test_minimal_valid():
     cfg = from_env(BASE)
     assert cfg.guild_id == 123
     assert cfg.timezone_name == "UTC"
-    assert cfg.weights.participation == 0.5
+    assert cfg.weights.participation == 0.3
     assert not cfg.ai_enabled
 
 

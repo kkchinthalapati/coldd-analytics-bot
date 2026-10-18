@@ -109,7 +109,7 @@ Who may run which command is decided in **Discord** (Server Settings → Integra
 | `/help` | Command list |
 | `/analytics [days] [ai_read]` | Dashboard: messages, active and returning members, joins/departures, peak hour, concentration, coverage, comparison with the previous period; optional AI read |
 | `/insights [days]` | Growth, engagement (daily/weekly active, stickiness), weekday-by-hour heatmap, new-member retention, top channels |
-| `/top [metric] [days]` | Leaderboard by messages (counted and raw), consistency, streak, reactions given, interactions, helpfulness or voice; optional AI highlight |
+| `/top [metric] [days]` | Leaderboard by messages (counted and raw), consistency, streak, reactions given, interactions, helpfulness, voice, conversation partners or presence; optional AI highlight |
 | `/profile [member] [days]` | One member's figures and rank in every category |
 | `/motw` | Current Member of the Week leaders |
 | `/weekly show [week] [ai_check]` | Shortlist with score breakdown, reign, verification status and an optional AI fairness read |
@@ -197,7 +197,9 @@ A warning is logged and shown in `/health` when the file reaches 80% of `STORAGE
 * **Reactions received and given:** one per reacting member per message. Self-reactions and bot reactions are ignored. Live, received reactions are credited for messages in the recent-message window; a rebuild reads the real reactions for every message and attributes them to the day of the message.
 * **Voice:** sampled every save interval. A member is credited while in a non-AFK voice or stage channel with at least `VOICE_MIN_MEMBERS` humans present and not deafened. A new session is counted when they appear.
 * **Coverage:** connected time per day. Offline periods longer than 60 s are recorded as gaps. Missing activity is never estimated. A day rebuilt from Discord's history counts as fully covered for messages.
-* **Non-scoring channels:** channels listed in `SCORE_EXCLUDE_CHANNEL_IDS` (for example a counting channel) are still counted in analytics, but their messages earn nothing toward Member of the Week or the `/top` message board.
+* **Scoring scope:** with `SCORE_CHANNEL_IDS` and/or `SCORE_CHANNEL_PREFIXES` set, only those channels (and channels whose name starts with a prefix, such as `ticket-` and `closed-`) count toward Member of the Week and the `/top` boards. Analytics still counts everything. Days not yet rebuilt by `/import_history` fall back to all channels until they are rebuilt.
+* **Conversation partners:** the distinct humans a member replied to, mentioned, or was replied to or mentioned by, in scored channels. Stored per day as 31-bit tokens, never names. Posting alone can't raise it.
+* **Presence:** the distinct hours of the day (in the configured timezone) in which a member posted in scored channels, summed over the days. Spreading chat across the day counts; a burst in one hour doesn't.
 
 ### Verified counts
 
@@ -216,9 +218,11 @@ For the chosen week, among **eligible** members:
 
 | Component | Default weight | Calculation (each normalised 0–1 against the best eligible candidate) |
 |---|---|---|
-| Participation | 50% | √(effective messages) / √(best). Effective = messages − duplicates − bursts, capped at `DAILY_MESSAGE_CAP` per day |
-| Consistency | 20% | active days / days elapsed in the week |
-| Helpfulness | 20% | (replies, capped per day) + 0.5 × (reactions received, capped per day) + `NOMINATION_WEIGHT` × staff nominations |
+| Participation | 30% | √(effective messages) / √(best). Effective = messages − duplicates − bursts, capped at `DAILY_MESSAGE_CAP` per day |
+| Consistency | 15% | active days / days elapsed in the week |
+| Conversation | 20% | √(distinct people talked with) / √(best) |
+| Presence | 10% | √(distinct active hours) / √(best) |
+| Helpfulness | 15% | (replies, capped per day) + 0.5 × (reactions received, capped per day) + `NOMINATION_WEIGHT` × staff nominations |
 | Extra | 10% | Average of √(voice minutes) / √(best) and √(reactions given, capped per day) / √(best); whichever is available |
 
 `score = 100 × Σ weightᵢ × componentᵢ`. If **no** eligible candidate has data for a component that week (no replies, reactions or nominations, or voice disabled), that component's weight is **redistributed proportionally** to the others. Nobody is penalised for a metric the bot couldn't observe, and the report says so.

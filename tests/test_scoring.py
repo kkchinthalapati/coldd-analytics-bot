@@ -45,12 +45,12 @@ def test_scores_normalised_and_weights_redistributed(data):
     r = score_week(data, cfg, WEEK, AFTER)
     # No replies/reactions/nominations/voice => only participation + consistency, renormalised.
     assert set(r["available_components"]) == {"participation", "consistency"}
-    assert r["weights"]["participation"] == pytest.approx(0.5 / 0.7, abs=1e-3)
+    assert r["weights"]["participation"] == pytest.approx(0.30 / 0.45, abs=1e-3)
     assert r["weights"]["helpfulness"] == 0 and r["weights"]["extra"] == 0
     top = r["shortlist"][0]
     assert top["uid"] == "1" and top["score"] == pytest.approx(100.0)
     second = r["shortlist"][1]
-    expected = 100 * ((0.5 / 0.7) * (30 ** 0.5 / 140 ** 0.5) + (0.2 / 0.7) * (3 / 7))
+    expected = 100 * ((0.30 / 0.45) * (30 ** 0.5 / 140 ** 0.5) + (0.15 / 0.45) * (3 / 7))
     assert second["score"] == pytest.approx(expected, abs=0.01)
     assert any("helpfulness" in w for w in r["warnings"])
 

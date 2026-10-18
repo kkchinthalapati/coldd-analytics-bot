@@ -33,6 +33,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from . import recount
+from .collector import scored_counts
 from .config import Config
 from .timeutil import day_start_ts, to_local, week_bounds_ts, week_days, week_start
 
@@ -52,6 +53,8 @@ class Candidate:
     voice_minutes: float = 0.0
     reactions_given: int = 0
     non_scoring_messages: int = 0
+    partners: int = 0
+    presence_hours: int = 0
     imported: int = 0
     channels: int = 0
     components: dict[str, float] = field(default_factory=dict)
@@ -138,6 +141,7 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
     elapsed_days = max(1, elapsed_days)
 
     cands: dict[str, Candidate] = {}
+    partner_sets: dict[str, set[int]] = {}
     members = data["members"]
     for day in days:
         users = data["days"].get(day, {}).get("u", {})
@@ -145,25 +149,27 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
             c = cands.get(uid)
             if c is None:
                 c = cands[uid] = Candidate(uid=uid, name=members.get(uid, {}).get("n", uid))
-            m, d, b = rec.get("m", 0), rec.get("d", 0), rec.get("b", 0)
-            # Messages in non-scoring channels (e.g. counting) are removed from the score. Duplicate and burst
-            # flags are not tracked per channel, so a flagged message there can be subtracted twice; this errs
-            # towards not rewarding volume.
-            excl = sum(n for cid, n in rec.get("c", {}).items() if int(cid) in cfg.score_exclude_channel_ids)
-            eff = max(0, m - d - b - excl)
-            c.non_scoring_messages += excl
+            # Only messages in scored channels count (every channel when no scope is configured).
+            m, d, b, r = scored_counts(rec, cfg)
+            eff = max(0, m - d - b)
+            c.non_scoring_messages += max(0, rec.get("m", 0) - m)
             c.messages_raw += m
             c.duplicates += d
             c.bursts += b
             c.effective_messages += min(eff, cfg.daily_message_cap)
             if eff >= cfg.min_daily_messages_for_active:
                 c.active_days += 1
-            c.replies += min(rec.get("r", 0), cfg.daily_reply_cap)
+            c.replies += min(r, cfg.daily_reply_cap)
+            partner_sets.setdefault(uid, set()).update(rec.get("pp", ()))
+            c.presence_hours += bin(rec.get("sh", 0)).count("1")
             c.reactions += min(rec.get("rx", 0), cfg.daily_reaction_cap)
             c.voice_minutes += rec.get("v", 0) / 60
             c.reactions_given += min(rec.get("rg", 0), cfg.daily_reaction_cap)
             c.imported += rec.get("i", 0)
             c.channels = max(c.channels, len(rec.get("c", {})))
+
+    for uid, tokens in partner_sets.items():
+        cands[uid].partners = len(tokens)
 
     noms = data["nominations"].get(wk, {})
     for uid, n in noms.items():
@@ -204,10 +210,14 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
     max_help = max((c.helpful_points + cfg.nomination_weight * c.nominations for c in eligible), default=0)
     max_voice = maxof("voice_minutes")
     max_given = maxof("reactions_given")
+    max_partners = maxof("partners")
+    max_presence = maxof("presence_hours")
 
     available = {"participation": True, "consistency": True,
                  "helpfulness": max_help > 0,
-                 "extra": (cfg.voice_enabled and max_voice > 0) or max_given > 0}
+                 "extra": (cfg.voice_enabled and max_voice > 0) or max_given > 0,
+                 "conversation": max_partners > 0,
+                 "presence": max_presence > 0}
     raw_weights = cfg.weights.as_dict()
     total_w = sum(w for k, w in raw_weights.items() if available[k])
     weights = {k: (w / total_w if available[k] and total_w else 0.0) for k, w in raw_weights.items()}
@@ -228,14 +238,19 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
             if max_given > 0:
                 parts.append(math.sqrt(c.reactions_given) / math.sqrt(max_given))
             comp["extra"] = sum(parts) / len(parts) if parts else 0.0
+        if available["conversation"]:
+            comp["conversation"] = math.sqrt(c.partners) / math.sqrt(max_partners)
+        if available["presence"]:
+            comp["presence"] = math.sqrt(c.presence_hours) / math.sqrt(max_presence)
         c.components = comp
         c.score = 100 * sum(weights[k] * v for k, v in comp.items())
         if c.messages_raw and (c.duplicates + c.bursts) / c.messages_raw >= cfg.spam_flag_ratio:
             c.flags.append(
                 f"review: {100 * (c.duplicates + c.bursts) / c.messages_raw:.0f}% of messages were duplicates/bursts (excluded from score)"
             )
-        if c.non_scoring_messages and c.messages_raw and c.non_scoring_messages / c.messages_raw >= 0.5:
-            c.flags.append(f"{100 * c.non_scoring_messages / c.messages_raw:.0f}% of messages were in non-scoring channels")
+        outside = c.non_scoring_messages
+        if outside and outside / (outside + c.messages_raw) >= 0.5:
+            c.flags.append(f"{100 * outside / (outside + c.messages_raw):.0f}% of their messages were outside the scored channels")
         if c.imported:
             c.flags.append(f"{c.imported} messages came from retrospective import")
         joined = members.get(c.uid, {}).get("j")
