@@ -41,8 +41,12 @@ def dragon_file() -> discord.File:
     return discord.File(str(ASSETS / DRAGON_NAME), filename=DRAGON_NAME)
 
 
+# Served from the public repository, so embeds can point at it without re-uploading the image on every reply.
+DRAGON_URL = "https://raw.githubusercontent.com/kkchinthalapati/coldd-analytics-bot/main/coldd/assets/dragon.png"
+
+
 def dragon_url() -> str:
-    return f"attachment://{DRAGON_NAME}"
+    return DRAGON_URL
 
 
 def banner_url() -> str:
@@ -62,6 +66,7 @@ def card(title: str, description: str, guild: discord.Guild | None, color: int =
          footer: str = "") -> discord.Embed:
     """A styled embed: logo in the title, banner-coloured accent, optional footer line."""
     embed = discord.Embed(title=f"{logo(guild)}  {title}"[:256], description=description[:4000], color=color)
+    embed.set_thumbnail(url=DRAGON_URL)
     if footer:
         embed.set_footer(text=footer[:2000])
     return embed

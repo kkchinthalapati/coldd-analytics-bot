@@ -522,7 +522,9 @@ def rss_mb() -> float | None:
 def embed(title: str, description: str = "", color: int = BRAND) -> discord.Embed:
     if len(description) > EMBED_DESC_LIMIT:
         description = description[: EMBED_DESC_LIMIT - 40] + "\n… (truncated; see attached file)"
-    return discord.Embed(title=title[:256], description=description, color=color)
+    e = discord.Embed(title=title[:256], description=description, color=color)
+    e.set_thumbnail(url=ui.dragon_url())
+    return e
 
 
 def text_file(name: str, content: str | bytes) -> discord.File:
@@ -579,8 +581,7 @@ def register_commands(bot: ColddBot) -> None:
             "Counts match Discord's history for rebuilt days. The bot stores no message text and never pays or awards anything itself.",
         ]
         help_embed = embed("COLDD Analytics: help", "\n".join(lines))
-        help_embed.set_thumbnail(url=ui.dragon_url())
-        await inter.response.send_message(embed=help_embed, file=ui.dragon_file(), ephemeral=True)
+        await inter.response.send_message(embed=help_embed, ephemeral=True)
 
     @tree.command(name="analytics", description="Server activity dashboard")
     @app_commands.describe(days="Number of days (default 7)", ai_read="Add a short AI-written read of the figures")
@@ -681,8 +682,7 @@ def register_commands(bot: ColddBot) -> None:
                      f"{row['reactions']} reactions received" for row in rows]
             e = ui.card(f"Member of the Week · week of {r['week']}", "\n".join(lines), inter.guild,
                         footer=f"Winner announced by staff · award {cfg.award_amount} {cfg.award_currency} · coverage {ui.pct(r['coverage']['ratio'])}")
-        e.set_thumbnail(url=ui.dragon_url())
-        await inter.followup.send(embed=e, file=ui.dragon_file())
+        await inter.followup.send(embed=e)
 
     @tree.command(name="profile", description="A member's community profile and ranks")
     @app_commands.describe(member="Member to view (default: you)", days="Window in days (default 30)")
