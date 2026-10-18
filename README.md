@@ -1,6 +1,6 @@
 # COLDD Analytics Bot
 
-A single, always-on Discord bot for COLDD. It collects lightweight activity statistics, saves them to `data.json`, and gives staff on-demand analytics, a full server audit and a weekly **Member of the Week** shortlist for the 100 Robux award.
+A single, always-on Discord bot for COLDD. It collects lightweight activity statistics, saves them to `data.json`, and gives on-demand analytics, leaderboards and a weekly **Member of the Week** shortlist for the 150 Robux award. Message and reaction counts for completed days are rebuilt from Discord's own history, so they match what Discord's search shows.
 
 * **Aggregates, not archives.** The bot stores per-member daily counters (messages, active days, replies, reactions received, voice minutes) and per-channel totals. It never saves message text, attachments or raw Discord objects.
 * **Safe JSON storage.** Writes are atomic, backups rotate, a corrupt file is recovered from a backup, and the bot never silently starts over with empty data.
@@ -102,27 +102,26 @@ Use the panel's **Restart** or **Stop** button. The bot handles SIGTERM and SIGI
 
 ## 4. Commands
 
-All replies are **ephemeral** (only the person who ran the command sees them). Staff are `OWNER_IDS`, members with a `STAFF_ROLE_IDS` role, and, if `ALLOW_MANAGE_GUILD=true`, anyone with **Manage Server**.
+Who may run which command is decided in **Discord** (Server Settings → Integrations → the bot), not in the bot. Restrict `/forget`, `/export` and `/import_history` there.
 
-| Command | Who | What |
-|---|---|---|
-| `/help` | anyone | Command list |
-| `/analytics [days]` | staff | Messages, unique active members, returning members, joins/departures, peak hour, concentration, coverage, with comparison to the previous period |
-| `/audit [days]` | staff | Full Markdown audit (attached file) |
-| `/weekly show [week]` | staff | Member of the Week shortlist with score breakdown (`week`: 0 = current, -1 = last week) |
-| `/weekly nominate <member> <reason>` | staff | Staff nomination; counts toward helpfulness (once per staff member per week) |
-| `/weekly approve <member> [week] [note] [replace]` | staff | Record the chosen winner. Payout is manual |
-| `/weekly paid [week]` | staff | Mark the recorded award as paid |
-| `/weekly history` | staff | Previous winners |
-| `/weekly ai_review <member> <message_links>` | staff | Optional advisory AI read of up to 5 staff-chosen messages |
-| `/leaderboard [days] [metric]` | staff | Top 20 by effective messages, active days, helpfulness or voice |
-| `/channels [days]` | staff | Messages, share, unique members and trend per channel |
-| `/member <user> [days]` | staff | One member's aggregates |
-| `/health` | staff | Connection, coverage, gaps, save status, file size, record counts, memory |
-| `/export <kind>` | staff / owner | Audit `.md`, weekly / leaderboard / channels / daily `.csv`; **full data backup** (`.json.gz`, owner only) |
-| `/config` | staff | Current settings, secrets hidden |
-| `/import_history <channel> [days]` | owner | Import missed history for one channel (needs `HISTORY_IMPORT_ENABLED=true`) |
-| `/forget <user> confirm:True` | owner | Delete a member's stored statistics (privacy request) |
+| Command | What |
+|---|---|
+| `/help` | Command list |
+| `/analytics [days] [ai_read]` | Dashboard: messages, active and returning members, joins/departures, peak hour, concentration, coverage, comparison with the previous period; optional AI read |
+| `/insights [days]` | Growth, engagement (daily/weekly active, stickiness), weekday-by-hour heatmap, new-member retention, top channels |
+| `/top [metric] [days]` | Leaderboard by messages (counted and raw), consistency, streak, reactions given, interactions, helpfulness or voice; optional AI highlight |
+| `/profile [member] [days]` | One member's figures and rank in every category |
+| `/motw` | Current Member of the Week leaders |
+| `/weekly show [week] [ai_check]` | Shortlist with score breakdown, reign, verification status and an optional AI fairness read |
+| `/weekly nominate <member> <reason>` | Staff nomination; counts toward helpfulness (once per staff member per week) |
+| `/weekly approve <member> [week] [note] [replace] [unverified]` | Record the chosen winner. Refuses an unverified week unless `unverified:True`. Payout is manual |
+| `/weekly paid [week]` · `/weekly history` | Mark an award paid · previous winners |
+| `/weekly ai_review <member> <message_links>` | Advisory AI read of up to 5 staff-chosen messages |
+| `/deepscan` | Deep AI analysis of every aggregate metric; keeps the last reports as memory |
+| `/import_history [days] [reactions]` | Rebuild exact counts for the last N complete days from Discord's history (see "Verified counts") |
+| `/export <kind>` | Audit `.md`; weekly / leaderboard / channels / daily `.csv`; full data backup (`.json.gz`) |
+| `/health` | Connection, coverage, verified days, save status, file size, memory |
+| `/forget <user> confirm:True` | Delete a member's stored statistics (privacy request) |
 
 Slash commands are registered to your server on every start, so they appear immediately. If they don't, re-invite the bot with the `applications.commands` scope.
 
@@ -195,9 +194,21 @@ A warning is logged and shown in `/health` when the file reaches 80% of `STORAGE
 * **Duplicates:** the same normalised text from the same member within `DUPLICATE_WINDOW_SECONDS`. Detection uses a 64-bit fingerprint held in memory for minutes; text is never stored.
 * **Bursts:** messages beyond `BURST_THRESHOLD` within `BURST_WINDOW_SECONDS` from one member. Duplicates and bursts still appear in raw totals but don't count toward scores. They're flagged for staff review only.
 * **Replies:** replies to another human's message.
-* **Reactions received:** one per reacting member per message, for messages seen within the recent-message window. Self-reactions and bot reactions are ignored.
+* **Reactions received and given:** one per reacting member per message. Self-reactions and bot reactions are ignored. Live, received reactions are credited for messages in the recent-message window; a rebuild reads the real reactions for every message and attributes them to the day of the message.
 * **Voice:** sampled every save interval. A member is credited while in a non-AFK voice or stage channel with at least `VOICE_MIN_MEMBERS` humans present and not deafened. A new session is counted when they appear.
-* **Coverage:** connected time per day. Offline periods longer than 60 s are recorded as gaps. Missing activity is never estimated.
+* **Coverage:** connected time per day. Offline periods longer than 60 s are recorded as gaps. Missing activity is never estimated. A day rebuilt from Discord's history counts as fully covered for messages.
+* **Non-scoring channels:** channels listed in `SCORE_EXCLUDE_CHANNEL_IDS` (for example a counting channel) are still counted in analytics, but their messages earn nothing toward Member of the Week or the `/top` message board.
+
+### Verified counts
+
+Live counting can drift from Discord: the bot may have been offline, messages get deleted long after they were counted, and reactions can predate the bot. `/import_history` fixes this for **completed days**. It reads every channel, voice-channel chat, forum post and active, archived and private thread the bot can read, and replaces the stored message and reaction counters for those days. The result matches Discord's history, and it is repeatable: running it twice gives the same numbers.
+
+* It works in 30-day batches. A batch is applied only when every channel was read successfully, so an interruption or Discord error never leaves a half-updated day.
+* A safety backup of `data.json` is taken first.
+* Today is never touched (live counting owns it). Voice time cannot be recovered from history and stays live-only.
+* Every day after 04:00 local time the bot re-verifies the last `AUTO_RECOUNT_DAYS` complete days (default 3) automatically.
+* `/weekly approve` refuses a week that hasn't been verified, so awards are decided on numbers that match Discord.
+* Compare with Discord's search over the **same date range**: Discord's search has no retention limit, the bot keeps `MEMBER_RETENTION_DAYS`.
 
 ### Member of the Week score
 
@@ -208,9 +219,11 @@ For the chosen week, among **eligible** members:
 | Participation | 50% | √(effective messages) / √(best). Effective = messages − duplicates − bursts, capped at `DAILY_MESSAGE_CAP` per day |
 | Consistency | 20% | active days / days elapsed in the week |
 | Helpfulness | 20% | (replies, capped per day) + 0.5 × (reactions received, capped per day) + `NOMINATION_WEIGHT` × staff nominations |
-| Extra | 10% | √(voice minutes) / √(best) |
+| Extra | 10% | Average of √(voice minutes) / √(best) and √(reactions given, capped per day) / √(best); whichever is available |
 
 `score = 100 × Σ weightᵢ × componentᵢ`. If **no** eligible candidate has data for a component that week (no replies, reactions or nominations, or voice disabled), that component's weight is **redistributed proportionally** to the others. Nobody is penalised for a metric the bot couldn't observe, and the report says so.
+
+**Reign:** `WINNER_COOLDOWN_WEEKS` defaults to 0, so the current leader stays eligible and `/weekly show` reports how many consecutive weeks they have held the title. Set it above 0 to force rotation.
 
 **Eligibility:** not a bot, no `EXCLUDE_ROLE_IDS` role, still in the server, didn't win in the last `WINNER_COOLDOWN_WEEKS`, at least `MIN_WEEKLY_MESSAGES` effective messages, and active on at least `MIN_ACTIVE_DAYS` days (relaxed for a week that's still in progress).
 
@@ -220,7 +233,9 @@ For the chosen week, among **eligible** members:
 
 ### Optional AI
 
-AI is off unless `AI_PROVIDER` (`anthropic` or `openai`/compatible), `AI_API_KEY` and `AI_MODEL` are set. It's used **only** by `/weekly ai_review`:
+AI is off unless at least one provider is configured. Providers are tried in order and the first usable reply wins: Gemini (`GEMINI_API_KEY`, `GEMINI_MODEL`), then OpenRouter (`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`), then the generic `AI_PROVIDER`/`AI_API_KEY`/`AI_MODEL`/`AI_BASE_URL` provider (any OpenAI-compatible API, or Anthropic). A provider that errors, times out or returns nothing hands over to the next.
+
+It powers `/analytics ai_read`, `/top ai_highlight`, `/weekly show ai_check`, `/deepscan` and `/weekly ai_review`. Everything except `ai_review` sends only anonymous aggregates (counts, distributions, ranks): never names, IDs or message text. `/weekly ai_review` works like this:
 
 * Staff paste up to `AI_MAX_MESSAGES_PER_REQUEST` message links.
 * The bot sends only those messages' text (truncated, no names or IDs) in one request.
@@ -279,8 +294,9 @@ Your host's numbers will differ; `/health` and the timing line at the end of eac
 
 ## 10. Limitations
 
-* Only activity observed while online is counted. History from before installation or during downtime is unknown, unless you import it with `/import_history` (labelled as imported, one channel at a time, threads not included).
-* Deletions and reactions on messages older than the recent-message window, or from before the last restart, can't be attributed.
+* Live counting only sees activity while the bot is online. Run `/import_history` to rebuild completed days exactly from Discord's history; until a day has been rebuilt, its counts are provisional.
+* Live deletions and live reactions on messages older than the recent-message window can't be attributed; a rebuild corrects them for completed days. Reactions are attributed to the day of the message, because Discord does not expose when a reaction was added.
+* Messages from bots and webhooks are not counted as members.
 * Joins and departures are known only while the bot is online. Retention cohorts appear after a few weeks of data.
 * Voice time is sampled (± one save interval per session).
 * Helpfulness signals (replies, reactions, nominations) are proxies, not judgements of quality.

@@ -32,8 +32,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from . import recount
 from .config import Config
-from .timeutil import day_start_ts, week_bounds_ts, week_days, week_start
+from .timeutil import day_start_ts, to_local, week_bounds_ts, week_days, week_start
 
 
 @dataclass
@@ -50,6 +51,7 @@ class Candidate:
     nominations: int = 0
     voice_minutes: float = 0.0
     reactions_given: int = 0
+    non_scoring_messages: int = 0
     imported: int = 0
     channels: int = 0
     components: dict[str, float] = field(default_factory=dict)
@@ -83,17 +85,23 @@ def week_coverage(data: dict[str, Any], cfg: Config, start: date, now: int) -> d
     tz = cfg.tz
     begin, end = week_bounds_ts(start, tz)
     elapsed = max(0, min(now, end) - begin)
-    observed = sum(data["server"].get(d, {}).get("cov", 0) for d in week_days(start))
-    gaps = [g for g in data["meta"].get("gaps", []) if g[1] > begin and g[0] < end]
+    wdays = week_days(start)
+    rebuilt = data["meta"].get("recounted", {})
+    # A day rebuilt from Discord's history is exact for messages, however long the bot was offline.
+    observed = sum(max(data["server"].get(d, {}).get("cov", 0), 86400 if d in rebuilt else 0) for d in wdays)
+    ver = recount.verification(data, wdays, to_local(now, tz).date())
+    gaps = [] if ver["all_verified"] else [g for g in data["meta"].get("gaps", []) if g[1] > begin and g[0] < end]
     collection_start = data["meta"].get("collection_start")
     ratio = min(1.0, observed / elapsed) if elapsed else 0.0
     return {
+        "verified_days": ver["verified_days"], "verified": ver["all_verified"],
+        "verified_at": ver["oldest_verified_at"],
         "observed_hours": round(observed / 3600, 1),
         "elapsed_hours": round(elapsed / 3600, 1),
         "ratio": round(ratio, 3),
         "gaps": len(gaps),
         "complete_week": now >= end,
-        "started_mid_week": bool(collection_start and collection_start > begin),
+        "started_mid_week": bool(collection_start and collection_start > begin) and not ver["all_verified"],
     }
 
 
@@ -138,7 +146,12 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
             if c is None:
                 c = cands[uid] = Candidate(uid=uid, name=members.get(uid, {}).get("n", uid))
             m, d, b = rec.get("m", 0), rec.get("d", 0), rec.get("b", 0)
-            eff = max(0, m - d - b)
+            # Messages in non-scoring channels (e.g. counting) are removed from the score. Duplicate and burst
+            # flags are not tracked per channel, so a flagged message there can be subtracted twice; this errs
+            # towards not rewarding volume.
+            excl = sum(n for cid, n in rec.get("c", {}).items() if int(cid) in cfg.score_exclude_channel_ids)
+            eff = max(0, m - d - b - excl)
+            c.non_scoring_messages += excl
             c.messages_raw += m
             c.duplicates += d
             c.bursts += b
@@ -221,6 +234,8 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
             c.flags.append(
                 f"review: {100 * (c.duplicates + c.bursts) / c.messages_raw:.0f}% of messages were duplicates/bursts (excluded from score)"
             )
+        if c.non_scoring_messages and c.messages_raw and c.non_scoring_messages / c.messages_raw >= 0.5:
+            c.flags.append(f"{100 * c.non_scoring_messages / c.messages_raw:.0f}% of messages were in non-scoring channels")
         if c.imported:
             c.flags.append(f"{c.imported} messages came from retrospective import")
         joined = members.get(c.uid, {}).get("j")
@@ -240,6 +255,10 @@ def score_week(data: dict[str, Any], cfg: Config, start: date, now: int | None =
         warnings.append("No helpfulness evidence (replies, reactions, nominations) this week; its weight was redistributed.")
     if cfg.voice_enabled and not available["extra"]:
         warnings.append("No voice participation observed this week; the extra-participation weight was redistributed.")
+    if not coverage["verified"]:
+        warnings.append(
+            f"Not verified against Discord's history ({coverage['verified_days']} of 7 days). "
+            "Run /import_history before approving so the counts match what Discord shows.")
     shortlist = eligible[: cfg.shortlist_size]
     if len(shortlist) >= 2 and shortlist[0].tie:
         warnings.append("The top position is tied; staff must break the tie manually.")

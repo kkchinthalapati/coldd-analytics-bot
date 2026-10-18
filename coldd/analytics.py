@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from datetime import date, timedelta
 from typing import Any
 
+from . import recount
 from .config import Config
 from .scoring import resolve_week, score_week
 from .timeutil import day_start_ts, days_back, fmt_ts, now_ts, week_start
@@ -92,10 +93,12 @@ def channel_name(data: dict[str, Any], cid: str) -> str:
 
 
 def coverage_for(data: dict[str, Any], days: list[str], today: date, now: int, cfg: Config) -> dict[str, Any]:
-    observed = sum(data["server"].get(d, {}).get("cov", 0) for d in days)
+    rebuilt = data["meta"].get("recounted", {})
+    observed = sum(max(data["server"].get(d, {}).get("cov", 0), 86400 if d in rebuilt else 0) for d in days)
     start = day_start_ts(date.fromisoformat(days[0]), cfg.tz)
     elapsed = max(1, min(now, day_start_ts(date.fromisoformat(days[-1]) + timedelta(days=1), cfg.tz)) - start)
-    zero_days = [d for d in days if data["server"].get(d, {}).get("cov", 0) == 0 and d <= today.isoformat()]
+    zero_days = [d for d in days if data["server"].get(d, {}).get("cov", 0) == 0 and d not in rebuilt
+                 and d <= today.isoformat()]
     cs = data["meta"].get("collection_start")
     return {
         "ratio": min(1.0, observed / elapsed),
@@ -199,7 +202,7 @@ METRICS = {
 
 
 def leaderboard(data: dict[str, Any], cfg: Config, days_n: int, today: date, metric: str = "messages",
-                limit: int = 15) -> list[dict[str, Any]]:
+                limit: int | None = 15) -> list[dict[str, Any]]:
     days = period(today, days_n)
     agg: dict[str, dict[str, Any]] = {}
     for day in days:
@@ -373,7 +376,8 @@ def member_table(data: dict[str, Any], cfg: Config, days_n: int, today: date) ->
             a = agg.setdefault(uid, {"eff": 0, "m": 0, "days": 0, "streak": 0, "r": 0, "rx": 0, "rg": 0, "v": 0})
             m = rec.get("m", 0)
             a["m"] += m
-            a["eff"] += min(max(0, m - rec.get("d", 0) - rec.get("b", 0)), cfg.daily_message_cap)
+            excl = sum(n for cid, n in rec.get("c", {}).items() if int(cid) in cfg.score_exclude_channel_ids)
+            a["eff"] += min(max(0, m - rec.get("d", 0) - rec.get("b", 0) - excl), cfg.daily_message_cap)
             a["days"] += 1 if m > 0 else 0
             a["r"] += min(rec.get("r", 0), cfg.daily_reply_cap)
             a["rx"] += min(rec.get("rx", 0), cfg.daily_reaction_cap)
@@ -444,7 +448,18 @@ def deep_stats(data: dict[str, Any], cfg: Config, today: date) -> dict[str, Any]
         ins = insights(data, cfg, w, today)
         vals = sorted(float(r["value"]) for r in leaderboard(data, cfg, w, today, "messages", limit=None))
         chans = [r for r in channel_stats(data, cfg, w, today) if r["messages"]][:10]
+        table = member_table(data, cfg, w, today)
+
+        def dist(key: str, table: dict[str, dict[str, Any]] = table) -> dict[str, float]:
+            v = sorted(float(a[key]) for a in table.values() if a[key] > 0)
+            return {"members": len(v), "p50": _pick(v, 0.5), "p90": _pick(v, 0.9), "p99": _pick(v, 0.99),
+                    "max": v[-1] if v else 0}
+
+        window_days = period(today, w)
         out["windows"][f"{w}d"] = {
+            "days_verified_against_discord": len(recount.verified_days(data, window_days)), "window_days": w,
+            "distribution_reactions_given": dist("rg"), "distribution_replies_sent": dist("r"),
+            "distribution_active_days": dist("days"), "distribution_longest_streak": dist("streak"),
             "messages": s["messages"], "messages_previous": s["messages_prev"],
             "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
             "returning_members": s["returning"],

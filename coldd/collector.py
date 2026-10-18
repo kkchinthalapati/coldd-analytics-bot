@@ -313,7 +313,7 @@ class Collector:
             if reactor_id in reactors:
                 return False  # one credit per reacting member per message
             reactors.add(reactor_id)
-            inc(self.user_day(entry[1], author), "rx")
+            inc(self.user_day(entry[1], entry[0]), "rx")
         else:
             if not reactors or reactor_id not in reactors:
                 return False

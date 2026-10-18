@@ -94,6 +94,9 @@ class Config:
     include_channel_ids: set[int] = field(default_factory=set)
     exclude_channel_ids: set[int] = field(default_factory=set)
     exclude_role_ids: set[int] = field(default_factory=set)
+    # Channels (or categories) that are counted in analytics but earn nothing toward Member of the Week and the
+    # /top message board, e.g. counting or spam channels that would otherwise reward volume over contribution.
+    score_exclude_channel_ids: set[int] = field(default_factory=set)
     count_bots: bool = False
 
     message_content_intent: bool = True
@@ -123,8 +126,8 @@ class Config:
 
     audit_max_days: int = 180
     export_max_rows: int = 5000
-    history_import_enabled: bool = False
-    history_import_max_messages: int = 20000
+    history_import_enabled: bool = True
+    auto_recount_days: int = 3  # nightly re-verification of the last N complete days (0 = off)
 
     # Tried in this order: Gemini, OpenRouter, then the generic AI_* provider (Radox). Any may be left blank.
     gemini_api_key: str = ""
@@ -206,6 +209,8 @@ class Config:
             },
             "shortlist_size": self.shortlist_size,
             "history_import_enabled": self.history_import_enabled,
+            "auto_recount_days": self.auto_recount_days,
+            "score_exclude_channels": len(self.score_exclude_channel_ids),
             "ai": " > ".join(f"{r.name}:{r.model}" for r in self.ai_chain()) or "disabled",
             "owners": len(self.owner_ids),
             "staff_roles": len(self.staff_role_ids),
@@ -337,6 +342,7 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         inactive_member_retention_days=as_int("INACTIVE_MEMBER_RETENTION_DAYS", 120, 14, 3650),
         include_channel_ids=_ids(get("INCLUDE_CHANNEL_IDS"), "INCLUDE_CHANNEL_IDS", problems),
         exclude_channel_ids=_ids(get("EXCLUDE_CHANNEL_IDS"), "EXCLUDE_CHANNEL_IDS", problems),
+        score_exclude_channel_ids=_ids(get("SCORE_EXCLUDE_CHANNEL_IDS"), "SCORE_EXCLUDE_CHANNEL_IDS", problems),
         exclude_role_ids=_ids(get("EXCLUDE_ROLE_IDS"), "EXCLUDE_ROLE_IDS", problems),
         count_bots=as_bool("COUNT_BOTS", False),
         message_content_intent=as_bool("MESSAGE_CONTENT_INTENT", True),
@@ -363,8 +369,8 @@ def from_env(env: dict[str, str] | None = None) -> Config:
         nomination_weight=as_float("NOMINATION_WEIGHT", 5.0, 0, 1000),
         audit_max_days=as_int("AUDIT_MAX_DAYS", 180, 7, 1825),
         export_max_rows=as_int("EXPORT_MAX_ROWS", 5000, 10, 100000),
-        history_import_enabled=as_bool("HISTORY_IMPORT_ENABLED", False),
-        history_import_max_messages=as_int("HISTORY_IMPORT_MAX_MESSAGES", 20000, 100, 1_000_000),
+        history_import_enabled=as_bool("HISTORY_IMPORT_ENABLED", True),
+        auto_recount_days=as_int("AUTO_RECOUNT_DAYS", 3, 0, 30),
         ai_provider=provider,
         ai_api_key=get("AI_API_KEY"),
         ai_model=get("AI_MODEL"),

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import make_cfg
 
-from coldd.bot import Access, ColddBot, build_intents, merge_ranges, subtract_ranges
+from coldd.bot import ColddBot, build_intents
 from coldd.collector import Collector
 from coldd.storage import Store
 
@@ -62,24 +62,16 @@ def test_intents_least_privilege():
     assert not i.presences and not i.typing and not i.dm_messages and not i.guild_reactions
 
 
-def test_access_rules():
-    a = Access(make_cfg(owner_ids={1}))
-    assert a.is_owner(interaction(1)) and not a.is_owner(interaction(2))
-    assert a.is_staff(interaction(1)) and not a.is_staff(interaction(2))  # non-Member users are never staff
-    fallback = Access(make_cfg(owner_ids=set()))
-    assert fallback.is_owner(interaction(999)) and not fallback.is_owner(interaction(1))
-
-
 def test_expected_commands_registered(bot):
     names = {c.name for c in bot.tree.get_commands()}
-    assert {"help", "analytics", "audit", "weekly", "leaderboard", "channels", "member", "health", "export",
-            "config", "import_history", "forget"} <= names
+    assert names == {"help", "analytics", "insights", "top", "profile", "motw", "weekly", "deepscan", "health",
+                     "export", "import_history", "forget"}
     weekly = bot.tree.get_command("weekly")
     assert {c.name for c in weekly.commands} == {"show", "approve", "paid", "history", "nominate", "ai_review"}
 
 
 @pytest.mark.parametrize("name,kwargs", [
-    ("health", {}), ("config", {}), ("channels", {"days": 7}),
+    ("health", {}), ("analytics", {"days": 7}), ("insights", {"days": 30}), ("top", {"metric": "messages", "days": 7}),
 ])
 def test_commands_run_without_role_or_owner_gate(bot, name, kwargs):
     """Access is controlled by Discord's integration settings, not by checks in the bot."""
@@ -89,15 +81,12 @@ def test_commands_run_without_role_or_owner_gate(bot, name, kwargs):
     assert "restricted" not in str(inter.response.sent[0][0])
 
 
-def test_owner_can_run_reports_ephemerally(bot):
+def test_health_reports_verification_and_stays_ephemeral(bot):
     inter = interaction(1)
     asyncio.run(bot.tree.get_command("health").callback(inter))
     _, kw = inter.response.sent[0]
     assert kw["ephemeral"] and "Bot health" in kw["embed"].title
-    inter = interaction(1)
-    asyncio.run(bot.tree.get_command("audit").callback(inter, days=30))
-    _, kw = inter.followup.sent[0]
-    assert kw["ephemeral"] and kw["file"].filename.endswith(".md")
+    assert "Verified against Discord" in kw["embed"].description
 
 
 def test_owner_data_export_is_gzip(bot):
@@ -110,13 +99,6 @@ def test_owner_data_export_is_gzip(bot):
     f = inter.followup.sent[0][1]["file"]
     payload = json.loads(gzip.decompress(f.fp.read()))
     assert payload["schema_version"] == 1
-
-
-def test_config_output_hides_token(bot):
-    inter = interaction(1)
-    asyncio.run(bot.tree.get_command("config").callback(inter))
-    emb = inter.response.sent[0][1]["embed"]
-    assert bot.cfg.token not in emb.description
 
 
 def fake_message(author_id=10, bot_author=False, webhook=None, guild_id=111, channel_id=500, system=False, content="hi"):
@@ -190,13 +172,6 @@ def test_disconnect_reconnect_records_gap(bot, monkeypatch):
     assert bot.connected
 
 
-def test_ranges():
-    assert merge_ranges([[5, 10], [1, 3], [2, 6]]) == [[1, 10]]
-    assert subtract_ranges([[0, 100]], [[10, 20], [50, 60]]) == [[0, 10], [20, 50], [60, 100]]
-    assert subtract_ranges([[0, 10]], [[0, 10]]) == []
-    assert subtract_ranges([[0, 10], [5, 15]], []) == [[0, 15]]
-
-
 def test_health_before_connect_does_not_crash(bot):
     h = bot.health()
     assert h["latency_ms"] is None and h["connected"] is False
@@ -217,3 +192,29 @@ def test_voice_sampling_counts_sessions_present_at_startup(bot, monkeypatch):
     u = bot.store.data["days"]["2026-10-12"]["u"]
     assert set(u) == {"1", "2"}  # deafened, bot and alone-in-channel members are not credited
     assert u["1"]["vs"] == 1 and 59 <= u["1"]["v"] <= 61
+
+
+def weekly_approve(bot, **kw):
+    inter = interaction(1)
+    cmd = bot.tree.get_command("weekly").get_command("approve")
+    asyncio.run(cmd.callback(inter, member=SimpleNamespace(id=5, mention="<@5>"), week=-1, note="", replace=False, **kw))
+    return inter.response.sent[0][0]
+
+
+def test_approve_requires_a_verified_week(bot):
+    assert "isn't verified" in weekly_approve(bot, unverified=False)
+    assert "isn't verified" not in weekly_approve(bot, unverified=True)
+
+
+def test_approve_passes_the_gate_once_the_week_is_verified(bot):
+    from datetime import timedelta
+
+    from coldd import scoring
+    from coldd.bot import today_for
+    from coldd.timeutil import now_ts
+
+    wk = scoring.resolve_week(bot.cfg, today_for(bot.cfg), -1)
+    stamps = bot.store.data["meta"].setdefault("recounted", {})
+    for i in range(7):
+        stamps[(wk + timedelta(days=i)).isoformat()] = now_ts()
+    assert "isn't verified" not in weekly_approve(bot, unverified=False)

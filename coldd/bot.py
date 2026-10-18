@@ -10,17 +10,18 @@ import math
 import os
 import re
 import time
-from datetime import date, datetime, timezone
-from typing import Any
+from collections.abc import Awaitable, Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, cast
 
 import discord
 from discord import app_commands
 
-from . import __version__, ai, analytics, scoring, ui
-from .collector import Collector, SpamTracker, content_fingerprint
+from . import __version__, ai, analytics, recount, scoring, ui
+from .collector import Collector, content_fingerprint
 from .config import Config
 from .storage import Store
-from .timeutil import fmt_ts, now_ts, to_local
+from .timeutil import day_start_ts, fmt_ts, now_ts, to_local
 
 log = logging.getLogger("coldd.bot")
 
@@ -28,6 +29,8 @@ EMBED_DESC_LIMIT = 3900
 DEEPSCAN_COOLDOWN_S = 6 * 3600   # one deep scan per six hours, server-wide
 DEEPSCAN_TIMEOUT_S = 240         # long-form reports take far longer than a chat reply
 DEEPSCAN_KEEP = 6                # previous reports kept in data.json as the bot's memory
+RECOUNT_CHUNK_DAYS = 30          # days rebuilt per batch: bounds memory, and each batch is applied atomically
+RECOUNT_MAX_CHUNK_MESSAGES = 500_000  # safety valve for a 1 GB host; a batch beyond this is skipped, not half-applied
 UPLOAD_LIMIT = 8 * 1024 * 1024
 LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
 BRAND = 0x5DADE2
@@ -45,26 +48,6 @@ def build_intents(cfg: Config) -> discord.Intents:
     return intents
 
 
-class Access:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def is_owner(self, inter: discord.Interaction) -> bool:
-        if self.cfg.owner_ids:
-            return inter.user.id in self.cfg.owner_ids
-        return bool(inter.guild and inter.guild.owner_id == inter.user.id)
-
-    def is_staff(self, inter: discord.Interaction) -> bool:
-        if self.is_owner(inter):
-            return True
-        user = inter.user
-        if not isinstance(user, discord.Member):
-            return False
-        if any(r.id in self.cfg.staff_role_ids for r in user.roles):
-            return True
-        return self.cfg.allow_manage_guild and user.guild_permissions.manage_guild
-
-
 class ColddBot(discord.Client):
     def __init__(self, cfg: Config, store: Store, collector: Collector):
         super().__init__(
@@ -76,11 +59,11 @@ class ColddBot(discord.Client):
         self.cfg = cfg
         self.store = store
         self.collector = collector
-        self.access = Access(cfg)
         self.tree = app_commands.CommandTree(self)
         self.started_at = time.time()
         self.connected = False
         self._ticker: asyncio.Task[None] | None = None
+        self._auto_task: asyncio.Task[None] | None = None
         self._save_lock = asyncio.Lock()
         self._last_voice_sample: float | None = None
         self._import_running = False
@@ -103,6 +86,8 @@ class ColddBot(discord.Client):
             log.error("Slash command sync failed: %s", exc)
         if self._ticker is None or self._ticker.done():
             self._ticker = asyncio.create_task(self._tick_loop(), name="coldd-ticker")
+        if self._auto_task is None or self._auto_task.done():
+            self._auto_task = asyncio.create_task(self._auto_recount_loop(), name="coldd-auto-recount")
 
     async def on_ready(self) -> None:
         guild = self.get_guild(self.cfg.guild_id)
@@ -312,58 +297,150 @@ class ColddBot(discord.Client):
 
     # history import ---------------------------------------------------------------
 
-    async def import_history(self, channel: discord.TextChannel, days: int,
-                             progress: Any = None) -> dict[str, Any]:
-        """Owner-triggered, rate-limited import of messages the bot did not observe live."""
-        meta = self.store.data["meta"]
-        now = now_ts()
-        start = now - days * 86400
-        cs = meta.get("collection_start") or now
-        windows = [[start, min(cs, now)]] if start < cs else []
-        windows += [[max(g[0], start), g[1]] for g in meta.get("gaps", []) if g[1] > start]
-        done = meta.setdefault("imports", {}).get(str(channel.id), [])
-        windows = subtract_ranges(windows, done)
-        tracker = SpamTracker(self.cfg.duplicate_window_seconds, self.cfg.burst_window_seconds, self.cfg.burst_threshold)
-        count = skipped = 0
-        count_id, check_ids = self._resolve_channel(channel)
-        if not self.collector.channel_allowed(*check_ids):
-            return {"imported": 0, "skipped": 0, "windows": 0, "note": "channel is excluded by configuration"}
-        for w0, w1 in windows:
-            if count >= self.cfg.history_import_max_messages:
-                break
-            last_ts = w0
-            after = datetime.fromtimestamp(w0, tz=timezone.utc)
-            before = datetime.fromtimestamp(w1, tz=timezone.utc)
-            async for msg in channel.history(after=after, before=before, oldest_first=True,
-                                             limit=self.cfg.history_import_max_messages - count):
-                if msg.is_system():
+    async def readable_targets(self, guild: discord.Guild) -> list[Any]:
+        """Every place people can post that the bot can read and that isn't excluded by configuration:
+        text channels, voice-channel text chats, stage text, forum posts, and active and archived threads."""
+        me = guild.me
+        candidates: list[Any] = [
+            ch for ch in guild.channels
+            if isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel))
+        ]
+        candidates += list(guild.threads)
+        for ch in [c for c in candidates if isinstance(c, (discord.TextChannel, discord.ForumChannel))]:
+            if not ch.permissions_for(me).read_message_history:
+                continue
+            try:
+                async for thread in ch.archived_threads(limit=None):
+                    candidates.append(thread)
+                if isinstance(ch, discord.TextChannel):  # private archived threads, visible to an administrator
+                    async for thread in ch.archived_threads(private=True, limit=None):
+                        candidates.append(thread)
+            except discord.HTTPException:
+                log.warning("Could not list archived threads in %s", ch.id)
+        seen: set[int] = set()
+        out: list[Any] = []
+        for ch in candidates:
+            if ch.id in seen or isinstance(ch, discord.ForumChannel):
+                continue
+            seen.add(ch.id)
+            perms = ch.permissions_for(me)
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            _, check_ids = self._resolve_channel(ch)
+            if self.collector.channel_allowed(*check_ids):
+                out.append(ch)
+        return out
+
+    async def _to_msg(self, m: discord.Message, count_id: int, with_reactions: bool, warnings: list[int]) -> recount.Msg | None:
+        """Turn a history message into the compact record the rebuild needs (message text is not kept)."""
+        if m.is_system():
+            return None
+        author = m.author
+        is_bot = author.bot or m.webhook_id is not None
+        ref = m.reference.resolved if m.reference else None
+        reply = isinstance(ref, discord.Message) and ref.author.id != author.id and not ref.author.bot
+        fp = content_fingerprint(m.content) if m.content else None
+        reactors: set[int] = set()
+        if with_reactions and not is_bot and m.reactions:
+            for reaction in m.reactions:
+                try:
+                    async for user in reaction.users(limit=None):
+                        if not user.bot and user.id != author.id:
+                            reactors.add(user.id)
+                except discord.HTTPException:
+                    warnings[0] += 1  # this message's reactions may be incomplete
+        return recount.Msg(int(m.created_at.timestamp()), author.id, count_id, fp, reply,
+                           getattr(author, "display_name", None) or author.name, is_bot, tuple(reactors))
+
+    async def rebuild_history(self, days: int, reactions: bool = True,
+                              progress: Callable[[int, int, int], Awaitable[None]] | None = None) -> dict[str, Any]:
+        """Rebuild exact counts for the last ``days`` complete days from Discord's own history.
+
+        Works in batches of RECOUNT_CHUNK_DAYS. A batch is applied only after every readable channel has been read
+        successfully, so an interruption or a Discord error never leaves a half-updated day: the batch is simply
+        skipped and a re-run redoes it. Today is never touched (live counting owns it).
+        """
+        guild = self.get_guild(self.cfg.guild_id)
+        if guild is None:
+            raise RuntimeError("not connected to the server")
+        tz = self.cfg.tz
+        today = to_local(now_ts(), tz).date()
+        days = max(1, min(days, self.cfg.member_retention_days))
+        all_days = recount.last_complete_days(today, days)
+        targets = await self.readable_targets(guild)
+        await asyncio.to_thread(self.store.make_backup, True)  # one safety copy before any counter is replaced
+        chunks = [all_days[i:i + RECOUNT_CHUNK_DAYS] for i in range(0, len(all_days), RECOUNT_CHUNK_DAYS)]
+        total_steps = max(1, len(chunks) * len(targets))
+        step = read = 0
+        warnings = [0]
+        out: dict[str, Any] = {"days_requested": days, "days_rebuilt": 0, "messages": 0, "channels": len(targets),
+                               "chunks_failed": 0, "failed": [], "skipped_channels": [], "reaction_warnings": 0,
+                               "reactions": reactions}
+        for chunk in chunks:
+            start = day_start_ts(date.fromisoformat(chunk[0]), tz)
+            end = day_start_ts(date.fromisoformat(chunk[-1]) + timedelta(days=1), tz)
+            after = datetime.fromtimestamp(start, tz=timezone.utc) - timedelta(milliseconds=1)
+            before = datetime.fromtimestamp(end, tz=timezone.utc)
+            msgs: list[recount.Msg] = []
+            failed = False
+            for ch in targets:
+                count_id, _ = self._resolve_channel(ch)
+                try:
+                    async for m in ch.history(after=after, before=before, limit=None, oldest_first=True):
+                        rec = await self._to_msg(m, count_id, reactions, warnings)
+                        if rec is not None:
+                            msgs.append(rec)
+                            read += 1
+                        if len(msgs) > RECOUNT_MAX_CHUNK_MESSAGES:
+                            raise MemoryError("batch too large")
+                except discord.Forbidden:
+                    if str(ch.id) not in out["skipped_channels"]:
+                        out["skipped_channels"].append(str(ch.id))
+                except (discord.HTTPException, MemoryError) as exc:
+                    failed = True
+                    out["failed"].append(f"{chunk[0]} to {chunk[-1]} in {ch.id}: {type(exc).__name__}")
+                    break
+                step += 1
+                if progress is not None:
+                    await progress(step, total_steps, read)
+            if failed:
+                out["chunks_failed"] += 1
+                continue
+            result = recount.rebuild_days(self.store.data, self.cfg, msgs, chunk, now_ts())  # one synchronous step
+            self.collector.dirty = True
+            await self.flush(reason="history rebuild")
+            out["days_rebuilt"] += result["days"]
+            out["messages"] += result["messages"]
+        out["reaction_warnings"] = warnings[0]
+        return out
+
+    async def _auto_recount_loop(self) -> None:
+        """Once a day after 04:00 local time, re-verify the last few complete days so deletions and any downtime
+        are corrected without anyone having to run a command."""
+        while True:
+            try:
+                await asyncio.sleep(600)
+                if self.cfg.auto_recount_days <= 0 or not self.connected or self._import_running:
                     continue
-                if msg.author.bot or msg.webhook_id:
-                    skipped += 1
+                local = to_local(now_ts(), self.cfg.tz)
+                key = local.date().isoformat()
+                meta = self.store.data["meta"]
+                if local.hour < 4 or meta.get("last_auto_recount") == key:
                     continue
-                ts = int(msg.created_at.timestamp())
-                fp = content_fingerprint(msg.content) if msg.content else None
-                ref = msg.reference.resolved if msg.reference else None
-                reply = isinstance(ref, discord.Message) and ref.author.id != msg.author.id and not ref.author.bot
-                excluded = isinstance(msg.author, discord.Member) and any(
-                    r.id in self.cfg.exclude_role_ids for r in msg.author.roles)
-                self.collector.record_message(
-                    msg.author.id, count_id, ts, name=getattr(msg.author, "display_name", None),
-                    fingerprint=fp, reply_to_other=reply, excluded_role=excluded, imported=True,
-                    flags_override=tracker.check(msg.author.id, ts, fp),
-                )
-                count += 1
-                last_ts = ts
-                if count % 500 == 0:
-                    await asyncio.sleep(0)
-                    if progress:
-                        await progress(count)
-            # Only mark the part actually read as done if the message limit cut the window short.
-            done.append([w0, w1] if count < self.cfg.history_import_max_messages else [w0, last_ts])
-        meta["imports"][str(channel.id)] = merge_ranges(done)
-        self.collector.dirty = True
-        await self.flush(reason="history import")
-        return {"imported": count, "skipped": skipped, "windows": len(windows)}
+                self._import_running = True
+                try:
+                    res = await self.rebuild_history(self.cfg.auto_recount_days, reactions=True)
+                finally:
+                    self._import_running = False
+                if res["chunks_failed"] == 0:
+                    meta["last_auto_recount"] = key
+                    self.collector.dirty = True
+                log.info("Nightly re-verification: %d day(s), %d messages, %d failed batch(es).",
+                         res["days_rebuilt"], res["messages"], res["chunks_failed"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Nightly re-verification failed; will retry.")
 
     # health ------------------------------------------------------------------------
 
@@ -416,35 +493,6 @@ def rss_mb() -> float | None:
     return None
 
 
-def merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
-    out: list[list[int]] = []
-    for a, b in sorted(ranges):
-        if out and a <= out[-1][1]:
-            out[-1][1] = max(out[-1][1], b)
-        else:
-            out.append([a, b])
-    return out
-
-
-def subtract_ranges(windows: list[list[int]], done: list[list[int]]) -> list[list[int]]:
-    result = []
-    for a, b in merge_ranges([w for w in windows if w[1] > w[0]]):
-        pieces = [[a, b]]
-        for d0, d1 in done:
-            nxt = []
-            for p0, p1 in pieces:
-                if d1 <= p0 or d0 >= p1:
-                    nxt.append([p0, p1])
-                    continue
-                if p0 < d0:
-                    nxt.append([p0, d0])
-                if d1 < p1:
-                    nxt.append([d1, p1])
-            pieces = nxt
-        result.extend(pieces)
-    return result
-
-
 # --- command helpers ----------------------------------------------------------------
 
 def embed(title: str, description: str = "", color: int = BRAND) -> discord.Embed:
@@ -488,32 +536,30 @@ def register_commands(bot: ColddBot) -> None:
     @tree.command(name="help", description="Explain the analytics bot's commands")
     async def help_cmd(inter: discord.Interaction) -> None:
         lines = [
-            "**Staff commands** (results are only visible to you):",
-            "`/analytics [days]` server activity dashboard",
-            "`/insights [days]` server health: growth, engagement, peak times, retention",
-            "`/summary [days]` AI-written summary of the same figures (aggregate only)",
-            "`/audit [days]` full analytics audit (Markdown report attached)",
-            "`/weekly show [week]` Member of the Week shortlist (0 = this week, -1 = last week)",
-            "`/weekly nominate` record a staff nomination with a reason",
-            "`/weekly approve` record the chosen winner (manual; nothing is paid or announced)",
-            "`/weekly paid` mark a recorded award as paid out",
-            "`/weekly history` previous winners",
-            "`/weekly ai_review` optional advisory AI read of staff-selected messages",
-            "`/leaderboard [days] [metric]` top members",
-            "`/channels [days]` channel activity",
-            "`/member <user> [days]` one member's stored statistics",
-            "`/health` uptime, coverage, storage and save status",
-            "`/export <kind>` CSV/Markdown reports, or a data backup (owner)",
-            "`/config` current non-secret settings",
-            "**Owner only:** `/import_history`, `/forget`",
+            "**Activity and rankings**",
+            "`/analytics [days] [ai_read]` server dashboard, optionally with an AI read",
+            "`/insights [days]` growth, engagement, peak times, retention",
+            "`/top [metric] [days]` leaderboards: messages, consistency, streaks, reactions, interactions, helpful, voice",
+            "`/profile [member]` one member's stats and ranks",
+            "`/deepscan` deep AI analysis of every metric",
             "",
-            "The bot counts activity only while online, stores no message text, and never awards anything automatically.",
+            "**Member of the Week**",
+            "`/motw` current leaders · `/weekly show [week] [ai_check]` full shortlist with a fairness read",
+            "`/weekly nominate` · `/weekly approve` (needs a verified week) · `/weekly paid` · `/weekly history`",
+            "`/weekly ai_review` advisory AI read of staff-selected messages",
+            "",
+            "**Data**",
+            "`/import_history [days]` rebuild exact counts from Discord's own history (also runs nightly for recent days)",
+            "`/export <kind>` reports and CSVs, or a full backup · `/health` status · `/forget` delete a member's data",
+            "",
+            "Counts match Discord's history for rebuilt days. The bot stores no message text and never pays or awards anything itself.",
         ]
         await inter.response.send_message(embed=embed("COLDD Analytics: help", "\n".join(lines)), ephemeral=True)
 
-    @tree.command(name="analytics", description="Server activity summary")
-    @app_commands.describe(days="Number of days (default 7)")
-    async def analytics_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
+    @tree.command(name="analytics", description="Server activity dashboard")
+    @app_commands.describe(days="Number of days (default 7)", ai_read="Add a short AI-written read of the figures")
+    async def analytics_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7,
+                            ai_read: bool = False) -> None:
         days = clamp_days(days, cfg)
         s = analytics.summary(data(), cfg, days, today_for(cfg))
         cov = s["coverage"]
@@ -542,6 +588,25 @@ def register_commands(bot: ColddBot) -> None:
         if notes:
             e.add_field(name="⚠️ Notes", value="\n".join(notes), inline=False)
         e.set_image(url=ui.banner_url())
+        if ai_read and cfg.ai_enabled and ai.budget_ok(data(), cfg, today_for(cfg).isoformat()):
+            await inter.response.defer(ephemeral=True, thinking=True)
+            stats = {
+                "period_days": days, "messages": s["messages"], "messages_previous": s["messages_prev"],
+                "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
+                "returning_members": s["returning"], "joins": s["joins"], "leaves": s["leaves"],
+                "mean_messages_per_active": round(s["avg_per_active"], 2),
+                "median_messages_per_active": round(s["median_per_active"], 2),
+                "top10pct_message_share": round(s["top10_share"], 3), "voice_hours": round(s["voice_hours"], 1),
+                "peak_hour": s["peak_hour"], "coverage_ratio": round(cov["ratio"], 3),
+                "coverage_ratio_previous": round(s["coverage_prev"], 3),
+                "daily_messages": [[d, m] for d, m, _ in s["daily"]],
+            }
+            ai.consume_budget(data())
+            try:
+                e.add_field(name="✨ AI read", value=(await asyncio.to_thread(ai.narrate, cfg, stats))[:1000], inline=False)
+            except ai.AIError as exc:
+                log.warning("AI read failed: %s", ai.redact(str(exc), cfg.secrets()))
+            return await inter.followup.send(embed=e, file=ui.banner_file(), ephemeral=True)
         await inter.response.send_message(embed=e, file=ui.banner_file(), ephemeral=True)
 
     community_choices = [app_commands.Choice(name=label, value=key) for key, (label, _, _) in analytics.COMMUNITY_METRICS.items()]
@@ -550,16 +615,21 @@ def register_commands(bot: ColddBot) -> None:
     @app_commands.describe(metric="What to rank by", days="Window in days (default 7)", ai_highlight="Add a short AI highlight (uses AI budget)")
     @app_commands.choices(metric=community_choices)
     async def top_cmd(inter: discord.Interaction, metric: str = "messages",
-                      days: app_commands.Range[int, 1, 90] = 7, ai_highlight: bool = False) -> None:
+                      days: app_commands.Range[int, 1, 365] = 7, ai_highlight: bool = False) -> None:
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         today = today_for(cfg)
         label, unit, _ = analytics.COMMUNITY_METRICS[metric]
         rows = analytics.community_board(data(), cfg, days, today, metric, limit=10)
         top = rows[0]["value"] if rows else 0
+        def extra(r: dict[str, Any]) -> str:
+            return f" · {r['m']:,} sent in total" if metric == "messages" and r["m"] != r["value"] else ""
+
         lines = [f"{ui.medal(r['rank'])} <@{r['uid']}>\n"
-                 f"┗ `{ui.bar(r['value'], top)}` **{r['value']:,}** {unit}" for r in rows]
+                 f"┗ `{ui.bar(r['value'], top)}` **{r['value']:,}** {unit}{extra(r)}" for r in rows]
+        v = recount.verification(data(), analytics.period(today, days), today)
+        verified = f"{v['verified_days']}/{v['complete_days']} days verified against Discord"
         e = ui.card(f"{label} · last {days} days", "\n".join(lines) or "No activity recorded in this window.", inter.guild,
-                    footer=f"Top {len(rows)} · bars scaled to #1 · {cfg.timezone_name}")
+                    footer=f"Top {len(rows)} · {verified} · counted messages exclude duplicates, bursts and non-scoring channels")
         if ai_highlight and rows and cfg.ai_enabled and ai.budget_ok(data(), cfg, today.isoformat()):
             await inter.response.defer(thinking=True)
             facts = {"metric": label, "unit": unit, "window_days": days, "ranked_members": len(rows),
@@ -587,10 +657,10 @@ def register_commands(bot: ColddBot) -> None:
                         footer=f"Winner announced by staff · award {cfg.award_amount} {cfg.award_currency} · coverage {ui.pct(r['coverage']['ratio'])}")
         await inter.followup.send(embed=e)
 
-    @tree.command(name="profile", description="Your community profile (staff can view anyone)")
-    @app_commands.describe(member="Member to view (staff only for others)", days="Window in days (default 30)")
+    @tree.command(name="profile", description="A member's community profile and ranks")
+    @app_commands.describe(member="Member to view (default: you)", days="Window in days (default 30)")
     async def profile_cmd(inter: discord.Interaction, member: discord.Member | None = None,
-                          days: app_commands.Range[int, 1, 90] = 30) -> None:
+                          days: app_commands.Range[int, 1, 365] = 30) -> None:
         target = member or inter.user
         days = min(clamp_days(days, cfg), cfg.member_retention_days)
         p = analytics.member_profile(data(), cfg, str(target.id), days, today_for(cfg))
@@ -604,7 +674,7 @@ def register_commands(bot: ColddBot) -> None:
 
         e = ui.card(f"Profile · {target.display_name}", f"Last {days} days · {cfg.timezone_name}", inter.guild)
         e.set_thumbnail(url=target.display_avatar.url)
-        e.add_field(name="💬 Messages", value=f"**{f['eff']:,}** · {place('messages')}", inline=True)
+        e.add_field(name="💬 Messages", value=f"**{f['eff']:,}** counted ({f['m']:,} sent) · {place('messages')}", inline=True)
         e.add_field(name="📅 Active days", value=f"**{f['days']}** of {p['window_days']} · {place('consistency')}", inline=True)
         e.add_field(name="🔥 Best streak", value=f"**{f['streak']}** days · {place('streak')}", inline=True)
         e.add_field(name="❤️ Reactions given", value=f"**{f['rg']:,}** · {place('reacting')}", inline=True)
@@ -613,7 +683,7 @@ def register_commands(bot: ColddBot) -> None:
         e.add_field(name="🎙️ Voice", value=f"**{round(f['v'] / 60)} min** · {place('voice')}", inline=True)
         await inter.response.send_message(embed=e, ephemeral=True)
 
-    @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention (staff)")
+    @tree.command(name="insights", description="Server health: growth, engagement, peak times, retention")
     @app_commands.describe(days="Number of days (default 30)")
     async def insights_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:
         days = clamp_days(days, cfg)
@@ -664,7 +734,7 @@ def register_commands(bot: ColddBot) -> None:
                         inline=False)
         await inter.response.send_message(embed=e, ephemeral=True)
 
-    @tree.command(name="deepscan", description="Deep AI analysis of every aggregate metric (staff, slow, rate-limited)")
+    @tree.command(name="deepscan", description="Deep AI analysis of every metric (slow, rate-limited)")
     async def deepscan_cmd(inter: discord.Interaction) -> None:
         if not cfg.ai_enabled:
             return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
@@ -699,52 +769,6 @@ def register_commands(bot: ColddBot) -> None:
                     footer="AI-written · aggregate figures only · full report attached")
         await inter.followup.send(embed=e, file=text_file(f"coldd-deepscan-{today.isoformat()}.md", text), ephemeral=True)
 
-    @tree.command(name="summary", description="AI-written summary of recent activity (staff, aggregate figures only)")
-    @app_commands.describe(days="Number of days (default 7)")
-    async def summary_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
-        if not cfg.ai_enabled:
-            return await inter.response.send_message("AI is not configured (set AI_PROVIDER, AI_API_KEY, AI_MODEL).", ephemeral=True)
-        today = today_for(cfg).isoformat()
-        if not ai.budget_ok(data(), cfg, today):
-            return await inter.response.send_message("Daily AI request budget reached (AI_MAX_REQUESTS_PER_DAY).", ephemeral=True)
-        await inter.response.defer(ephemeral=True, thinking=True)
-        days = clamp_days(days, cfg)
-        s = analytics.summary(data(), cfg, days, today_for(cfg))
-        stats = {
-            "period_days": days,
-            "messages": s["messages"], "messages_previous": s["messages_prev"],
-            "active_members": s["unique_active"], "active_members_previous": s["unique_active_prev"],
-            "returning_members": s["returning"],
-            "mean_messages_per_active": round(s["avg_per_active"], 2),
-            "median_messages_per_active": round(s["median_per_active"], 2),
-            "top10pct_message_share": round(s["top10_share"], 3),
-            "joins": s["joins"], "leaves": s["leaves"], "voice_hours": round(s["voice_hours"], 1),
-            "peak_hour": s["peak_hour"],
-            "coverage_ratio": round(s["coverage"]["ratio"], 3),
-            "coverage_ratio_previous": round(s["coverage_prev"], 3),
-            "daily_messages": [[d, m] for d, m, _ in s["daily"]],
-        }
-        ai.consume_budget(data())
-        try:
-            text = await asyncio.to_thread(ai.narrate, cfg, stats)
-        except ai.AIError as exc:
-            log.warning("AI summary failed: %s", ai.redact(str(exc), cfg.secrets()))
-            return await inter.followup.send(f"AI summary unavailable ({ai.redact(str(exc), cfg.secrets())}).", ephemeral=True)
-        e = ui.card(f"Summary · last {days} days", text, inter.guild, footer="AI-written from aggregate counts")
-        await inter.followup.send(embed=e, ephemeral=True)
-
-    @tree.command(name="audit", description="Run a full analytics audit (staff)")
-    @app_commands.describe(days="Number of days to audit (default 30)")
-    async def audit_cmd(inter: discord.Interaction, days: app_commands.Range[int, 7, 365] = 30) -> None:
-        await inter.response.defer(ephemeral=True, thinking=True)
-        days = clamp_days(days, cfg)
-        report, fig = analytics.run_audit(data(), cfg, days, today_for(cfg))
-        summary = (f"Messages: {fig['messages']:,} · Unique active: {fig['unique_active']:,} · "
-                   f"Joins/leaves: {fig['joins']:,}/{fig['leaves']:,} · Coverage: {fig['coverage']:.0%}\n"
-                   f"Computed in {fig['duration_ms']} ms. Full report attached.")
-        await inter.followup.send(embed=embed(f"Audit: last {days} days", summary),
-                                  file=text_file(f"coldd-audit-{today_for(cfg)}.md", report), ephemeral=True)
-
     weekly = app_commands.Group(name="weekly", description="Member of the Week")
 
     def week_result(offset: int) -> dict[str, Any]:
@@ -752,8 +776,10 @@ def register_commands(bot: ColddBot) -> None:
         return scoring.score_week(data(), cfg, start)
 
     @weekly.command(name="show", description="Generate the Member of the Week shortlist")
-    @app_commands.describe(week="0 = current week, -1 = last week, -2 = two weeks ago…")
-    async def weekly_show(inter: discord.Interaction, week: app_commands.Range[int, -52, 0] = 0) -> None:
+    @app_commands.describe(week="0 = current week, -1 = last week, -2 = two weeks ago…",
+                           ai_check="Add an AI fairness read of the shortlist (uses AI budget; sees no names)")
+    async def weekly_show(inter: discord.Interaction, week: app_commands.Range[int, -52, 0] = 0,
+                          ai_check: bool = False) -> None:
         await inter.response.defer(ephemeral=True, thinking=True)
         r = week_result(week)
         rows = r["shortlist"]
@@ -766,10 +792,15 @@ def register_commands(bot: ColddBot) -> None:
             held = scoring.reign_length(data(), str(rows[0]["uid"]), date.fromisoformat(r["week"]))
             if held:
                 reign_line = f"\n👑 <@{rows[0]['uid']}> has held the title for **{held}** consecutive week(s) so far"
+        cv = r["coverage"]
+        if cv["verified"]:
+            verify_line = f"\n✅ **Verified** against Discord's history (rebuilt <t:{cv['verified_at']}:R>)"
+        else:
+            verify_line = f"\n⚠️ **Provisional**: {cv['verified_days']} of 7 days verified. Run `/import_history` before approving"
         e = ui.card(f"Member of the Week · {r['week']}",
                     f"Award **{cfg.award_amount} {cfg.award_currency}** (paid manually)\n"
                     f"Eligible **{r['eligible_count']}** of {r['considered_count']} · "
-                    f"coverage **{ui.pct(r['coverage']['ratio'])}**" + reign_line,
+                    f"coverage **{ui.pct(r['coverage']['ratio'])}**" + reign_line + verify_line,
                     inter.guild, ui.color_for(r["coverage"]["ratio"]),
                     footer="Use /weekly approve to record a decision · full breakdown attached")
         for row in rows[:3]:
@@ -791,6 +822,19 @@ def register_commands(bot: ColddBot) -> None:
             e.add_field(name="No eligible candidates yet", value="Nothing met the minimums for this week.", inline=False)
         if warn:
             e.add_field(name="Notes", value="\n".join(warn)[:1024], inline=False)
+        if ai_check and rows and cfg.ai_enabled and ai.budget_ok(data(), cfg, today_for(cfg).isoformat()):
+            keep = ("rank", "score", "components", "messages_raw", "effective_messages", "duplicates", "bursts",
+                    "active_days", "replies", "reactions", "reactions_given", "non_scoring_messages", "nominations",
+                    "voice_minutes", "imported", "channels", "flags", "tie")
+            facts = {"week": r["week"], "verified": cv["verified"], "weights": r["weights"],
+                     "eligible": r["eligible_count"], "candidates": [{k: row[k] for k in keep} for row in rows[:5]],
+                     "ineligible": r["ineligible"], "warnings": r["warnings"]}
+            ai.consume_budget(data())
+            try:
+                e.add_field(name="🧠 AI fairness read",
+                            value=(await asyncio.to_thread(ai.explain_shortlist, cfg, facts))[:1000], inline=False)
+            except ai.AIError as exc:
+                log.warning("AI fairness read failed: %s", ai.redact(str(exc), cfg.secrets()))
         e.set_image(url=ui.banner_url())
         await inter.followup.send(embed=e,
                                   files=[ui.banner_file(), text_file(f"weekly-{r['week']}.md", analytics.weekly_markdown(r, cfg))],
@@ -798,10 +842,19 @@ def register_commands(bot: ColddBot) -> None:
 
     @weekly.command(name="approve", description="Record the staff-chosen Member of the Week (no automatic payout)")
     @app_commands.describe(member="Chosen winner", week="0 = current, -1 = last week (default)", note="Optional reason",
-                           replace="Replace an already recorded winner")
+                           replace="Replace an already recorded winner",
+                           unverified="Approve even though the week is not fully verified against Discord (not recommended)")
     async def weekly_approve(inter: discord.Interaction, member: discord.Member,
-                             week: app_commands.Range[int, -52, 0] = -1, note: str = "", replace: bool = False) -> None:
+                             week: app_commands.Range[int, -52, 0] = -1, note: str = "", replace: bool = False,
+                             unverified: bool = False) -> None:
         r = week_result(week)
+        cv = r["coverage"]
+        if not cv["verified"] and not unverified:
+            need = max(1, (today_for(cfg) - date.fromisoformat(r["days"][0])).days)
+            return await inter.response.send_message(
+                f"Week {r['week']} isn't verified against Discord's history yet ({cv['verified_days']} of 7 days). "
+                f"Run `/import_history days:{need}` first so the counts match what Discord shows, then approve. "
+                "To approve anyway, set `unverified: True`.", ephemeral=True)
         ok, msg = scoring.approve_winner(data(), cfg, r, member.id, inter.user.id, note, replace)
         if ok:
             bot.collector.dirty = True
@@ -891,59 +944,6 @@ def register_commands(bot: ColddBot) -> None:
 
     tree.add_command(weekly)
 
-    @tree.command(name="leaderboard", description="Top members for a period")
-    @app_commands.describe(days="Number of days (default 7)", metric="Ranking metric")
-    @app_commands.choices(metric=[app_commands.Choice(name=v[0], value=k) for k, v in analytics.METRICS.items()])
-    async def leaderboard_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7,
-                              metric: str = "messages") -> None:
-        days = min(clamp_days(days, cfg), cfg.member_retention_days)
-        rows = analytics.leaderboard(data(), cfg, days, today_for(cfg), metric, limit=20)
-        label = analytics.METRICS[metric][0]
-        top = rows[0]["value"] if rows else 0
-        lines = [f"{ui.medal(r['rank'])} <@{r['uid']}>\n"
-                 f"┗ `{ui.bar(r['value'], top)}` **{r['value']:,}** · {r['days']} active days" for r in rows]
-        e = ui.card(f"Leaderboard · {label}", "\n".join(lines) or "No activity recorded.", inter.guild,
-                    footer=f"Last {days} days · top {len(rows)} · bars scaled to #1")
-        await inter.response.send_message(embed=e, ephemeral=True)
-
-    @tree.command(name="channels", description="Channel activity analysis")
-    async def channels_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 7) -> None:
-        days = clamp_days(days, cfg)
-        rows = [r for r in analytics.channel_stats(data(), cfg, days, today_for(cfg)) if r["messages"] or r["prev"]][:25]
-        top = rows[0]["messages"] if rows else 0
-        lines = [f"<#{r['cid']}>\n┗ `{ui.bar(r['messages'], top)}` **{r['messages']:,}** "
-                 f"({ui.pct(r['share'])}) · {r['unique']} members · {r['trend']}" for r in rows]
-        unread = data()["meta"].get("unreadable_channels") or []
-        footer = f"Last {days} days"
-        if unread:
-            footer += f" · ⚠️ {len(unread)} channel(s) unreadable, not counted"
-        e = ui.card(f"Channels · last {days} days", "\n".join(lines) or "No activity recorded.", inter.guild,
-                    ui.WARN if unread else ui.BRAND, footer=footer)
-        await inter.response.send_message(embed=e, ephemeral=True)
-
-    @tree.command(name="member", description="A member's stored aggregate statistics")
-    async def member_cmd(inter: discord.Interaction, user: discord.User, days: app_commands.Range[int, 1, 365] = 30) -> None:
-        days = min(clamp_days(days, cfg), cfg.member_retention_days)
-        st = analytics.member_stats(data(), cfg, user.id, days, today_for(cfg))
-        if st is None:
-            return await inter.response.send_message("No statistics stored for that member.", ephemeral=True)
-        t, tz = st["totals"], cfg.tz
-        lines = [
-            f"**Messages:** {t['m']:,} ({t['d']} duplicates, {t['b']} burst, {t['i']} imported)",
-            f"**Active days:** {st['active_days']} of {days}",
-            f"**Replies to others:** {t['r']} · **Reactions received:** {t['rx']}",
-            f"**Voice:** {t['v'] / 60:.0f} min in {t['vs']} sessions",
-            f"**Rank (effective messages):** {st['rank'] or 'unranked'} of {st['ranked_members']}",
-            f"**Activity:** `{analytics.sparkline([n for _, n in st['daily']][-30:])}`",
-            "**Top channels:** " + (", ".join(f"<#{c}> {n}" for c, n in st["channels"]) or "none"),
-            f"**First seen:** {fmt_ts(st['first_seen'], tz)} · **Last active:** {fmt_ts(st['last_active'], tz)}",
-            f"**Joined (observed):** {fmt_ts(st['joined'], tz)}" + (f" · **Left:** {fmt_ts(st['left'], tz)}" if st["left"] else ""),
-            f"**Awards:** {', '.join(st['wins']) or 'none'} · **Nominations:** {st['nominations']}",
-        ]
-        if st["excluded"]:
-            lines.append("ℹ️ Has an excluded role: not eligible for Member of the Week.")
-        await inter.response.send_message(embed=embed(f"Member: {st['name']}", "\n".join(lines)), ephemeral=True)
-
     @tree.command(name="health", description="Collection coverage, uptime and storage status")
     async def health_cmd(inter: discord.Interaction) -> None:
         h, tz = bot.health(), cfg.tz
@@ -952,6 +952,9 @@ def register_commands(bot: ColddBot) -> None:
             f"**Uptime:** {h['uptime_h']:.1f} h · **Events this run:** {h['events']:,}",
             f"**Collecting since:** {fmt_ts(h['collection_start'], tz)} · **Last event:** {fmt_ts(h['last_event'], tz)}",
             f"**Coverage (7d):** {h['coverage_7d']:.0%} · **Gaps (7d):** {h['gaps_7d']}",
+            "**Verified against Discord (30d):** {} of {} complete days".format(
+                *(lambda v: (v["verified_days"], v["complete_days"]))(
+                    recount.verification(data(), analytics.period(today_for(cfg), 30), today_for(cfg)))),
             f"**Last save:** {fmt_ts(h['last_save'], tz)} ({h['save_ms']} ms) · pending changes: {'yes' if h['dirty'] else 'no'}",
             f"**data.json:** {h['file_kb']:.0f} KB (warning at {h['warn_mb']} MB){' ⚠️' if h['size_warning'] else ''} · backups: {h['backups']}",
             f"**Stored:** {h['members']:,} members · {h['member_days']:,} member-day records over {h['detail_days']} days · "
@@ -964,7 +967,7 @@ def register_commands(bot: ColddBot) -> None:
             lines.append(f"⚠️ **Last save failed:** {h['save_error']}")
         await inter.response.send_message(embed=embed("Bot health", "\n".join(lines)), ephemeral=True)
 
-    @tree.command(name="export", description="Export a report (staff) or a data backup (owner)")
+    @tree.command(name="export", description="Export a report (Markdown or CSV) or a full data backup")
     @app_commands.choices(kind=[
         app_commands.Choice(name="Audit report (Markdown)", value="audit"),
         app_commands.Choice(name="Weekly shortlist (CSV)", value="weekly"),
@@ -1021,117 +1024,82 @@ def register_commands(bot: ColddBot) -> None:
             log.info("Data backup exported by owner %s.", inter.user.id)
         await inter.followup.send(f"Export ready: `{f.filename}`", file=f, ephemeral=True)
 
-    @tree.command(name="config", description="Show non-secret configuration")
-    async def config_cmd(inter: discord.Interaction) -> None:
-        lines = [f"**{k}:** {v}" for k, v in cfg.safe_summary().items()]
-        await inter.response.send_message(embed=embed("Configuration (secrets hidden)", "\n".join(lines)), ephemeral=True)
-
-    async def readable_targets(guild: discord.Guild) -> list[Any]:
-        """Every place people can post that the bot can read and that isn't excluded by configuration:
-        text channels, voice-channel text chats, stage text, forum posts, and active and archived threads."""
-        me = guild.me
-        candidates: list[Any] = [
-            ch for ch in guild.channels
-            if isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel))
-        ]
-        candidates += list(guild.threads)
-        for ch in [c for c in candidates if isinstance(c, (discord.TextChannel, discord.ForumChannel))]:
-            if not ch.permissions_for(me).read_message_history:
-                continue
-            try:
-                async for thread in ch.archived_threads(limit=None):
-                    candidates.append(thread)
-            except discord.HTTPException:
-                log.warning("Could not list archived threads in %s", ch.id)
-        seen: set[int] = set()
-        out: list[Any] = []
-        for ch in candidates:
-            if ch.id in seen or isinstance(ch, discord.ForumChannel):
-                continue
-            seen.add(ch.id)
-            perms = ch.permissions_for(me)
-            if not (perms.view_channel and perms.read_message_history):
-                continue
-            _, check_ids = bot._resolve_channel(ch)
-            if bot.collector.channel_allowed(*check_ids):
-                out.append(ch)
-        return out
-
-    async def run_import(inter: discord.Interaction, targets: list[Any], days: int) -> None:
-        totals = {"imported": 0, "skipped": 0, "windows": 0}
-        failed: list[str] = []
-        total = len(targets)
+    async def run_rebuild(inter: discord.Interaction, days: int, reactions: bool) -> None:
         progress_msg: discord.Message | None = None
         try:
-            progress_msg = await inter.channel.send(f"Importing {days} days · starting {total} channel(s)…")
+            progress_msg = await cast(discord.abc.Messageable, inter.channel).send(
+                f"Rebuilding {days} day(s) from Discord's history · collecting channels…")
         except (discord.HTTPException, AttributeError):
-            log.warning("Could not post the import progress message; progress goes to logs only.")
+            log.warning("Could not post the rebuild progress message; progress goes to the logs only.")
         last_edit = 0.0
+
+        async def progress(done: int, total: int, read: int) -> None:
+            nonlocal last_edit
+            if progress_msg is None or (time.monotonic() - last_edit < 15 and done < total):
+                return
+            last_edit = time.monotonic()
+            try:
+                await progress_msg.edit(content=f"Rebuilding {days} day(s) · `{ui.bar(done, total, 20)}` "
+                                                f"{done}/{total} steps · {read:,} messages read so far")
+            except discord.HTTPException:
+                pass
+
+        res: dict[str, Any] | None = None
+        error = ""
         try:
-            for done, ch in enumerate(targets, 1):
-                try:
-                    res = await bot.import_history(ch, days, None)
-                except discord.Forbidden:
-                    failed.append(f"{ch.mention}: no access")
-                    res = {}
-                except Exception as exc:  # keep going: one bad channel must not stop the rest
-                    log.exception("History import failed for channel %s", ch.id)
-                    failed.append(f"{ch.mention}: {type(exc).__name__}")
-                    res = {}
-                for k in totals:
-                    totals[k] += res.get(k, 0)
-                if res.get("note"):
-                    failed.append(f"{ch.mention}: {res['note']}")
-                log.info("History import %d/%d done (%s)", done, total, ch.id)
-                # Edit the progress message at most every 15 seconds, and always on the last channel.
-                if progress_msg and (time.monotonic() - last_edit >= 15 or done == total):
-                    last_edit = time.monotonic()
-                    try:
-                        await progress_msg.edit(content=(
-                            f"Importing {days} days · `{ui.bar(done, total, 20)}` {done}/{total} channels · "
-                            f"{totals['imported']:,} messages imported so far"))
-                    except discord.HTTPException:
-                        pass
+            res = await bot.rebuild_history(days, reactions, progress)
+        except Exception as exc:  # report it; never leave the import flag stuck
+            log.exception("History rebuild failed")
+            error = type(exc).__name__
         finally:
             bot._import_running = False
-        e = ui.card(f"History import · last {days} days",
-                    f"Channels processed: **{len(targets)}**\n"
-                    f"Messages imported: **{totals['imported']:,}** · bot messages skipped: **{totals['skipped']:,}**\n"
-                    f"Uncovered windows filled: **{totals['windows']}**",
-                    inter.guild, ui.WARN if failed else ui.BRAND,
-                    footer="Imported messages are labelled separately · reactions are not back-filled")
-        if failed:
-            e.add_field(name="Skipped or failed", value="\n".join(failed)[:1024], inline=False)
+        if res is None:
+            e = ui.card("History rebuild failed", f"The rebuild stopped with **{error}**. Nothing was half-applied: "
+                        "completed batches are saved and the rest are untouched. Run it again.", inter.guild, ui.WARN)
+        else:
+            problems = bool(res["chunks_failed"] or res["skipped_channels"] or res["reaction_warnings"])
+            e = ui.card(f"History rebuilt · last {res['days_requested']} complete days",
+                        f"Days rebuilt: **{res['days_rebuilt']}** of {res['days_requested']}\n"
+                        f"Messages counted: **{res['messages']:,}** from **{res['channels']}** channels and threads\n"
+                        f"Reactions: **{'rebuilt' if res['reactions'] else 'not rebuilt (live counts kept)'}**",
+                        inter.guild, ui.WARN if problems else ui.GOOD,
+                        footer="Counts now match Discord's own history for these days · today is counted live · voice time is live-only")
+            notes = []
+            if res["chunks_failed"]:
+                notes.append(f"{res['chunks_failed']} batch(es) failed and were left unchanged; run it again:\n"
+                             + "\n".join(res["failed"][:5]))
+            if res["skipped_channels"]:
+                notes.append(f"{len(res['skipped_channels'])} channel(s) could not be read and are not included.")
+            if res["reaction_warnings"]:
+                notes.append(f"{res['reaction_warnings']} message(s) had reactions that could not be fully read.")
+            if notes:
+                e.add_field(name="Needs attention", value="\n".join(notes)[:1024], inline=False)
         try:
-            await inter.channel.send(content=inter.user.mention, embed=e)
+            await cast(discord.abc.Messageable, inter.channel).send(content=inter.user.mention, embed=e)
         except discord.HTTPException:
-            log.warning("Could not post the import report in the invoking channel; see logs for totals.")
-            log.info("History import finished: %s; failed: %s", totals, failed)
+            log.warning("Could not post the rebuild report in the invoking channel.")
+            log.info("History rebuild finished: %s", res or error)
 
-    @tree.command(name="import_history", description="Staff: import past messages for one channel, or every readable channel")
-    @app_commands.describe(channel="One channel (leave empty for every channel the bot can read)",
-                           days="How far back (max = member retention)")
-    async def import_cmd(inter: discord.Interaction, channel: discord.TextChannel | None = None,
-                         days: app_commands.Range[int, 1, 365] = 90) -> None:
+    @tree.command(name="import_history", description="Rebuild exact counts from Discord's own history for the last N complete days")
+    @app_commands.describe(days="Complete days back, up to the retention limit (default 30)",
+                           reactions="Also rebuild reactions given and received (slower, more accurate)")
+    async def import_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 730] = 30,
+                         reactions: bool = True) -> None:
         if not cfg.history_import_enabled:
             return await inter.response.send_message("History import is disabled. Set HISTORY_IMPORT_ENABLED=true to allow it.",
                                                      ephemeral=True)
         if bot._import_running:
-            return await inter.response.send_message("An import is already running.", ephemeral=True)
+            return await inter.response.send_message("A rebuild is already running.", ephemeral=True)
         days = min(days, cfg.member_retention_days)
-        await inter.response.defer(ephemeral=True, thinking=True)
-        targets = [channel] if channel else await readable_targets(inter.guild)
-        if not targets:
-            return await inter.followup.send("The bot can't read any channels to import.", ephemeral=True)
         bot._import_running = True
-        # The import can run for a long time, longer than Discord allows for a reply, so it runs in the background
+        # A full rebuild can take a long time, longer than Discord allows for a reply, so it runs in the background
         # and the report is posted to the channel where the command was run.
-        asyncio.create_task(run_import(inter, targets, days))
-        await inter.followup.send(
-            f"Importing {days} days from {len(targets)} channel(s) in the background. "
-            f"The report will be posted here when it finishes.", ephemeral=True)
+        asyncio.create_task(run_rebuild(inter, days, reactions))
+        await inter.response.send_message(
+            f"Rebuilding the last {days} complete day(s) from Discord's history in the background. "
+            f"This can take a while on a large server. The report will be posted here when it finishes.", ephemeral=True)
 
-    @tree.command(name="forget", description="Owner: delete a member's stored statistics (privacy request)")
+    @tree.command(name="forget", description="Delete a member's stored statistics (privacy request)")
     async def forget_cmd(inter: discord.Interaction, user: discord.User, confirm: bool = False) -> None:
         if not confirm:
             return await inter.response.send_message("Re-run with `confirm: True` to permanently delete this member's statistics.",
