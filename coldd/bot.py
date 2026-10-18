@@ -33,7 +33,7 @@ RECOUNT_CHUNK_DAYS = 30          # days rebuilt per batch: bounds memory, and ea
 RECOUNT_MAX_CHUNK_MESSAGES = 500_000  # safety valve for a 1 GB host; a batch beyond this is skipped, not half-applied
 UPLOAD_LIMIT = 8 * 1024 * 1024
 LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
-BRAND = 0x5DADE2
+BRAND = 0xD61F26  # COLDD red
 
 
 def build_intents(cfg: Config) -> discord.Intents:
@@ -578,7 +578,9 @@ def register_commands(bot: ColddBot) -> None:
             "",
             "Counts match Discord's history for rebuilt days. The bot stores no message text and never pays or awards anything itself.",
         ]
-        await inter.response.send_message(embed=embed("COLDD Analytics: help", "\n".join(lines)), ephemeral=True)
+        help_embed = embed("COLDD Analytics: help", "\n".join(lines))
+        help_embed.set_thumbnail(url=ui.dragon_url())
+        await inter.response.send_message(embed=help_embed, file=ui.dragon_file(), ephemeral=True)
 
     @tree.command(name="analytics", description="Server activity dashboard")
     @app_commands.describe(days="Number of days (default 7)", ai_read="Add a short AI-written read of the figures")
@@ -679,7 +681,8 @@ def register_commands(bot: ColddBot) -> None:
                      f"{row['reactions']} reactions received" for row in rows]
             e = ui.card(f"Member of the Week · week of {r['week']}", "\n".join(lines), inter.guild,
                         footer=f"Winner announced by staff · award {cfg.award_amount} {cfg.award_currency} · coverage {ui.pct(r['coverage']['ratio'])}")
-        await inter.followup.send(embed=e)
+        e.set_thumbnail(url=ui.dragon_url())
+        await inter.followup.send(embed=e, file=ui.dragon_file())
 
     @tree.command(name="profile", description="A member's community profile and ranks")
     @app_commands.describe(member="Member to view (default: you)", days="Window in days (default 30)")

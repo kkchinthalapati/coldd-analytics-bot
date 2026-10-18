@@ -15,9 +15,11 @@ ASSETS = Path(__file__).parent / "assets"
 BANNER_NAME = "coldd-banner.webp"
 LOGO_EMOJI_NAME = "colddlogo"
 
-BRAND = 0x5DADE2   # COLDD blue
-GOOD = 0x57F287
-WARN = 0xFEE75C
+DRAGON_NAME = "coldd-dragon.png"
+
+BRAND = 0xD61F26   # COLDD red, from the dragon emblem
+GOOD = 0x8B0000   # deep red: "done" and verified
+WARN = 0xFFB020   # amber: stays distinct from the brand red
 MUTED = 0x2B2D31
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -32,6 +34,15 @@ def banner_bytes() -> bytes:
 def banner_file() -> discord.File:
     """A fresh File object for each send (discord.py consumes the buffer)."""
     return discord.File(io.BytesIO(banner_bytes()), filename=BANNER_NAME)
+
+
+def dragon_file() -> discord.File:
+    """The COLDD dragon emblem, for thumbnails (a fresh File per send)."""
+    return discord.File(str(ASSETS / DRAGON_NAME), filename=DRAGON_NAME)
+
+
+def dragon_url() -> str:
+    return f"attachment://{DRAGON_NAME}"
 
 
 def banner_url() -> str:
