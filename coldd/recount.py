@@ -65,14 +65,18 @@ def verification(data: dict[str, Any], days: list[str], today: date) -> dict[str
     }
 
 
-def _clear(data: dict[str, Any], days: list[str]) -> None:
+REACTION_FIELDS = ("rx", "rg")
+
+
+def _clear(data: dict[str, Any], days: list[str], reactions: bool = True) -> None:
+    fields = USER_FIELDS if reactions else tuple(f for f in USER_FIELDS if f not in REACTION_FIELDS)
     for day in days:
         rec = data["days"].get(day)
         if rec is not None:
             users = rec["u"]
             for uid in list(users):
                 u = users[uid]
-                for f in USER_FIELDS:
+                for f in fields:
                     u.pop(f, None)
                 if not u:
                     del users[uid]
@@ -84,7 +88,8 @@ def _clear(data: dict[str, Any], days: list[str]) -> None:
                 srv.pop(f, None)
 
 
-def rebuild_days(data: dict[str, Any], cfg: Config, msgs: list[Msg], days: list[str], now: int) -> dict[str, int]:
+def rebuild_days(data: dict[str, Any], cfg: Config, msgs: list[Msg], days: list[str], now: int,
+                 reactions: bool = True) -> dict[str, int]:
     """Replace the message and reaction counters of ``days`` with counts computed from ``msgs``.
 
     Synchronous by design: it must never be split across an ``await``. ``msgs`` must contain every qualifying
@@ -95,7 +100,7 @@ def rebuild_days(data: dict[str, Any], cfg: Config, msgs: list[Msg], days: list[
     excluded_before = {uid for uid, rec in members.items() if rec.get("e")}
     last_event = data["meta"].get("last_event")
 
-    _clear(data, days)
+    _clear(data, days, reactions)
 
     col = Collector(data, cfg)  # fresh duplicate/burst tracker; shares the dataset
     counted = 0
@@ -106,7 +111,7 @@ def rebuild_days(data: dict[str, Any], cfg: Config, msgs: list[Msg], days: list[
         col.record_message(m.uid, m.cid, m.ts, name=m.name, is_bot=m.is_bot, fingerprint=m.fp,
                            reply_to_other=m.reply, excluded_role=False, scored=m.scored, partners=m.partners)
         counted += 1
-        if cfg.reactions_enabled and m.reactors and not (m.is_bot and not cfg.count_bots):
+        if reactions and cfg.reactions_enabled and m.reactors and not (m.is_bot and not cfg.count_bots):
             inc(col.user_day(day, m.uid), "rx", len(m.reactors))
             for reactor in m.reactors:
                 inc(col.user_day(day, reactor), "rg")

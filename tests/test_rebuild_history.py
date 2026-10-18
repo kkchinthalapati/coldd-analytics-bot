@@ -84,7 +84,7 @@ def test_rebuild_counts_complete_days_and_leaves_today_alone(bot):
     bot.store.data["days"][today] = {"u": {"1": {"m": 7}}}  # today belongs to live counting
     chans = [FakeChannel(10, [make_msg(1, when), make_msg(1, when + timedelta(minutes=5)), make_msg(2, when)]),
              FakeChannel(11, [make_msg(2, when + timedelta(minutes=1))])]
-    res = run(bot, chans, days=1, reactions=False)
+    res = run(bot, chans, days=1)
     d = bot.store.data
     assert d["days"][yday]["u"]["1"]["m"] == 2 and d["days"][yday]["u"]["2"]["m"] == 2
     assert d["days"][today]["u"]["1"]["m"] == 7
@@ -95,7 +95,7 @@ def test_rebuild_counts_complete_days_and_leaves_today_alone(bot):
 def test_unreadable_channel_is_skipped_but_the_rest_apply(bot):
     when, yday, _ = yesterday_noon(bot.cfg)
     chans = [FakeChannel(10, [make_msg(1, when)]), FakeChannel(11, [], error=http_error(discord.Forbidden))]
-    res = run(bot, chans, days=1, reactions=False)
+    res = run(bot, chans, days=1)
     assert bot.store.data["days"][yday]["u"]["1"]["m"] == 1
     assert res["skipped_channels"] == ["11"] and res["chunks_failed"] == 0
 
@@ -105,7 +105,7 @@ def test_discord_error_leaves_the_data_untouched(bot):
     bot.store.data["days"][yday] = {"u": {"1": {"m": 5}}}
     before = copy.deepcopy(bot.store.data["days"])
     chans = [FakeChannel(10, [make_msg(1, when)]), FakeChannel(11, [], error=http_error(discord.HTTPException))]
-    res = run(bot, chans, days=1, reactions=False)
+    res = run(bot, chans, days=1)
     assert bot.store.data["days"] == before  # nothing half-applied
     assert yday not in bot.store.data["meta"].get("recounted", {})
     assert res["chunks_failed"] == 1 and res["days_rebuilt"] == 0
@@ -114,9 +114,9 @@ def test_discord_error_leaves_the_data_untouched(bot):
 def test_rebuild_is_repeatable(bot):
     when, yday, _ = yesterday_noon(bot.cfg)
     chans = [FakeChannel(10, [make_msg(1, when), make_msg(2, when + timedelta(minutes=2))])]
-    run(bot, chans, days=1, reactions=False)
+    run(bot, chans, days=1)
     first = copy.deepcopy(bot.store.data["days"])
-    run(bot, chans, days=1, reactions=False)
+    run(bot, chans, days=1)
     assert bot.store.data["days"] == first
 
 
@@ -125,7 +125,7 @@ def test_reactions_skip_bots_and_the_author(bot):
     reactions = [FakeReaction([FakeUser(2), FakeUser(3), FakeUser(1), FakeUser(99, bot=True)]),
                  FakeReaction([FakeUser(2)])]  # member 2 reacted twice with different emoji: counts once
     chans = [FakeChannel(10, [make_msg(1, when, reactions=reactions)])]
-    res = run(bot, chans, days=1, reactions=True)
+    res = run(bot, chans, days=1, reaction_days=30)
     u = bot.store.data["days"][yday]["u"]
     assert u["1"]["rx"] == 2 and "rg" not in u["1"]  # received from 2 and 3 only
     assert u["2"]["rg"] == 1 and u["3"]["rg"] == 1 and "99" not in u
@@ -135,12 +135,12 @@ def test_reactions_skip_bots_and_the_author(bot):
 def test_a_backup_is_taken_before_counters_change(bot):
     when, yday, _ = yesterday_noon(bot.cfg)
     bot.store.write(bot.store.serialize())
-    run(bot, [FakeChannel(10, [make_msg(1, when)])], days=1, reactions=False)
+    run(bot, [FakeChannel(10, [make_msg(1, when)])], days=1)
     assert bot.store.backups(), "expected a safety backup"
 
 
 def test_days_are_capped_at_retention(bot):
     when, yday, _ = yesterday_noon(bot.cfg)
-    res = run(bot, [FakeChannel(10, [make_msg(1, when)])], days=100000, reactions=False)
+    res = run(bot, [FakeChannel(10, [make_msg(1, when)])], days=100000)
     assert res["days_requested"] == bot.cfg.member_retention_days
     assert recount.verification(bot.store.data, [yday], to_local(now_ts(), bot.cfg.tz).date())["all_verified"]

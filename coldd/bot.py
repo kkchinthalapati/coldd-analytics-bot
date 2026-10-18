@@ -30,6 +30,8 @@ DEEPSCAN_COOLDOWN_S = 6 * 3600   # one deep scan per six hours, server-wide
 DEEPSCAN_TIMEOUT_S = 240         # long-form reports take far longer than a chat reply
 DEEPSCAN_KEEP = 6                # previous reports kept in data.json as the bot's memory
 RECOUNT_CHUNK_DAYS = 30          # days rebuilt per batch: bounds memory, and each batch is applied atomically
+RECOUNT_REACTION_DAYS = 30        # reactions are rebuilt only for this many recent days (each costs a request)
+RECOUNT_CONCURRENCY = 4          # channels read at once: faster, and still well inside Discord's per-route limits
 RECOUNT_MAX_CHUNK_MESSAGES = 500_000  # safety valve for a 1 GB host; a batch beyond this is skipped, not half-applied
 UPLOAD_LIMIT = 8 * 1024 * 1024
 LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
@@ -375,13 +377,38 @@ class ColddBot(discord.Client):
                            getattr(author, "display_name", None) or author.name, is_bot, tuple(reactors),
                            scored, self._partners(m))
 
-    async def rebuild_history(self, days: int, reactions: bool = True,
-                              progress: Callable[[int, int, int], Awaitable[None]] | None = None) -> dict[str, Any]:
-        """Rebuild exact counts for the last ``days`` complete days from Discord's own history.
+    @staticmethod
+    def _thread_has_window_activity(ch: Any, start: datetime) -> bool:
+        """A thread archived before the window started cannot have posts inside it, so it is skipped."""
+        if isinstance(ch, discord.Thread) and ch.archived and ch.archive_timestamp is not None:
+            return ch.archive_timestamp >= start
+        return True
 
-        Works in batches of RECOUNT_CHUNK_DAYS. A batch is applied only after every readable channel has been read
-        successfully, so an interruption or a Discord error never leaves a half-updated day: the batch is simply
-        skipped and a re-run redoes it. Today is never touched (live counting owns it).
+    async def _read_channel(self, ch: Any, after: datetime, before: datetime, scored: bool, with_reactions: bool,
+                            warnings: list[int]) -> tuple[list[recount.Msg], str | None]:
+        """Every qualifying message in one channel for the window. Returns (messages, error or None)."""
+        count_id, _ = self._resolve_channel(ch)
+        msgs: list[recount.Msg] = []
+        try:
+            async for m in ch.history(after=after, before=before, limit=None, oldest_first=True):
+                rec = await self._to_msg(m, count_id, scored, with_reactions, warnings)
+                if rec is not None:
+                    msgs.append(rec)
+                if len(msgs) > RECOUNT_MAX_CHUNK_MESSAGES:
+                    raise MemoryError("batch too large")
+        except discord.Forbidden:
+            return [], "forbidden"
+        except (discord.HTTPException, MemoryError) as exc:
+            return [], type(exc).__name__
+        return msgs, None
+
+    async def rebuild_history(self, days: int, reaction_days: int = 0,
+                              progress: Callable[[int, int, int], Awaitable[None]] | None = None) -> dict[str, Any]:
+        """Rebuild exact message counts for the last ``days`` complete days from Discord's own history.
+
+        Reactions are rebuilt only for the most recent ``reaction_days`` (0 = none), because each reaction costs a
+        separate request. Channels are read a few at a time. A batch is applied only if every channel it needs was
+        read successfully, so an error never leaves a half-updated day. Today is never touched.
         """
         guild = self.get_guild(self.cfg.guild_id)
         if guild is None:
@@ -389,48 +416,59 @@ class ColddBot(discord.Client):
         tz = self.cfg.tz
         today = to_local(now_ts(), tz).date()
         days = max(1, min(days, self.cfg.member_retention_days))
+        reaction_days = max(0, min(reaction_days, days))
         all_days = recount.last_complete_days(today, days)
+        reaction_from = all_days[len(all_days) - reaction_days] if reaction_days else None
         targets = await self.readable_targets(guild)
         await asyncio.to_thread(self.store.make_backup, True)  # one safety copy before any counter is replaced
         chunks = [all_days[i:i + RECOUNT_CHUNK_DAYS] for i in range(0, len(all_days), RECOUNT_CHUNK_DAYS)]
         total_steps = max(1, len(chunks) * len(targets))
         step = read = 0
         warnings = [0]
+        sem = asyncio.Semaphore(RECOUNT_CONCURRENCY)
         out: dict[str, Any] = {"days_requested": days, "days_rebuilt": 0, "messages": 0, "channels": len(targets),
                                "chunks_failed": 0, "failed": [], "skipped_channels": [], "reaction_warnings": 0,
-                               "reactions": reactions}
+                               "reaction_days": reaction_days, "threads_skipped": 0}
         for chunk in chunks:
-            start = day_start_ts(date.fromisoformat(chunk[0]), tz)
-            end = day_start_ts(date.fromisoformat(chunk[-1]) + timedelta(days=1), tz)
-            after = datetime.fromtimestamp(start, tz=timezone.utc) - timedelta(milliseconds=1)
-            before = datetime.fromtimestamp(end, tz=timezone.utc)
+            start_dt = datetime.fromtimestamp(day_start_ts(date.fromisoformat(chunk[0]), tz), tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(day_start_ts(date.fromisoformat(chunk[-1]) + timedelta(days=1), tz), tz=timezone.utc)
+            after = start_dt - timedelta(milliseconds=1)
+            with_reactions = reaction_from is not None and chunk[-1] >= reaction_from
+            active = [ch for ch in targets if self._thread_has_window_activity(ch, start_dt)]
+            out["threads_skipped"] += len(targets) - len(active)
+
+            async def run(ch: Any, after: datetime = after, end_dt: datetime = end_dt,
+                          with_reactions: bool = with_reactions) -> tuple[Any, list[recount.Msg], str | None]:
+                count_id, _ = self._resolve_channel(ch)
+                async with sem:
+                    msgs, err = await self._read_channel(ch, after, end_dt, self._channel_scored(ch, count_id),
+                                                         with_reactions, warnings)
+                return ch, msgs, err
+
             msgs: list[recount.Msg] = []
             failed = False
-            for ch in targets:
-                count_id, _ = self._resolve_channel(ch)
-                scored = self._channel_scored(ch, count_id)
-                try:
-                    async for m in ch.history(after=after, before=before, limit=None, oldest_first=True):
-                        rec = await self._to_msg(m, count_id, scored, reactions, warnings)
-                        if rec is not None:
-                            msgs.append(rec)
-                            read += 1
-                        if len(msgs) > RECOUNT_MAX_CHUNK_MESSAGES:
-                            raise MemoryError("batch too large")
-                except discord.Forbidden:
+            pending = [asyncio.ensure_future(run(ch)) for ch in active]
+            for fut in asyncio.as_completed(pending):
+                ch, got, err = await fut
+                step += 1
+                if err == "forbidden":
                     if str(ch.id) not in out["skipped_channels"]:
                         out["skipped_channels"].append(str(ch.id))
-                except (discord.HTTPException, MemoryError) as exc:
+                elif err:
                     failed = True
-                    out["failed"].append(f"{chunk[0]} to {chunk[-1]} in {ch.id}: {type(exc).__name__}")
-                    break
-                step += 1
+                    out["failed"].append(f"{chunk[0]} to {chunk[-1]} in {ch.id}: {err}")
+                else:
+                    msgs.extend(got)
+                    read += len(got)
                 if progress is not None:
                     await progress(step, total_steps, read)
+            step += len(targets) - len(active)
             if failed:
+                for fut in pending:
+                    fut.cancel()
                 out["chunks_failed"] += 1
                 continue
-            result = recount.rebuild_days(self.store.data, self.cfg, msgs, chunk, now_ts())  # one synchronous step
+            result = recount.rebuild_days(self.store.data, self.cfg, msgs, chunk, now_ts(), reactions=with_reactions)
             self.collector.dirty = True
             await self.flush(reason="history rebuild")
             out["days_rebuilt"] += result["days"]
@@ -453,7 +491,7 @@ class ColddBot(discord.Client):
                     continue
                 self._import_running = True
                 try:
-                    res = await self.rebuild_history(self.cfg.auto_recount_days, reactions=True)
+                    res = await self.rebuild_history(self.cfg.auto_recount_days, reaction_days=0)
                 finally:
                     self._import_running = False
                 if res["chunks_failed"] == 0:
@@ -1054,7 +1092,7 @@ def register_commands(bot: ColddBot) -> None:
             log.info("Data backup exported by owner %s.", inter.user.id)
         await inter.followup.send(f"Export ready: `{f.filename}`", file=f, ephemeral=True)
 
-    async def run_rebuild(inter: discord.Interaction, days: int, reactions: bool) -> None:
+    async def run_rebuild(inter: discord.Interaction, days: int, reaction_days: int) -> None:
         progress_msg: discord.Message | None = None
         try:
             progress_msg = await cast(discord.abc.Messageable, inter.channel).send(
@@ -1077,7 +1115,7 @@ def register_commands(bot: ColddBot) -> None:
         res: dict[str, Any] | None = None
         error = ""
         try:
-            res = await bot.rebuild_history(days, reactions, progress)
+            res = await bot.rebuild_history(days, reaction_days, progress)
         except Exception as exc:  # report it; never leave the import flag stuck
             log.exception("History rebuild failed")
             error = type(exc).__name__
@@ -1091,7 +1129,7 @@ def register_commands(bot: ColddBot) -> None:
             e = ui.card(f"History rebuilt · last {res['days_requested']} complete days",
                         f"Days rebuilt: **{res['days_rebuilt']}** of {res['days_requested']}\n"
                         f"Messages counted: **{res['messages']:,}** from **{res['channels']}** channels and threads\n"
-                        f"Reactions: **{'rebuilt' if res['reactions'] else 'not rebuilt (live counts kept)'}**",
+                        f"Reactions: **{'rebuilt for the last ' + str(res['reaction_days']) + ' days' if res['reaction_days'] else 'not rebuilt (existing counts kept)'}**",
                         inter.guild, ui.WARN if problems else ui.GOOD,
                         footer="Counts now match Discord's own history for these days · today is counted live · voice time is live-only")
             notes = []
@@ -1112,9 +1150,9 @@ def register_commands(bot: ColddBot) -> None:
 
     @tree.command(name="import_history", description="Rebuild exact counts from Discord's own history for the last N complete days")
     @app_commands.describe(days="Complete days back, up to the retention limit (default 30)",
-                           reactions="Also rebuild reactions given and received (slower, more accurate)")
+                           reactions="Also rebuild reactions for the last 30 days (slower: one request per reaction)")
     async def import_cmd(inter: discord.Interaction, days: app_commands.Range[int, 1, 730] = 30,
-                         reactions: bool = True) -> None:
+                         reactions: bool = False) -> None:
         if not cfg.history_import_enabled:
             return await inter.response.send_message("History import is disabled. Set HISTORY_IMPORT_ENABLED=true to allow it.",
                                                      ephemeral=True)
@@ -1124,7 +1162,8 @@ def register_commands(bot: ColddBot) -> None:
         bot._import_running = True
         # A full rebuild can take a long time, longer than Discord allows for a reply, so it runs in the background
         # and the report is posted to the channel where the command was run.
-        asyncio.create_task(run_rebuild(inter, days, reactions))
+        reaction_days = min(days, RECOUNT_REACTION_DAYS) if reactions else 0
+        asyncio.create_task(run_rebuild(inter, days, reaction_days))
         await inter.response.send_message(
             f"Rebuilding the last {days} complete day(s) from Discord's history in the background. "
             f"This can take a while on a large server. The report will be posted here when it finishes.", ephemeral=True)
