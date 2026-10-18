@@ -1131,7 +1131,7 @@ def register_commands(bot: ColddBot) -> None:
                         f"Messages counted: **{res['messages']:,}** from **{res['channels']}** channels and threads\n"
                         f"Reactions: **{'rebuilt for the last ' + str(res['reaction_days']) + ' days' if res['reaction_days'] else 'not rebuilt (existing counts kept)'}**",
                         inter.guild, ui.WARN if problems else ui.GOOD,
-                        footer="Counts now match Discord's own history for these days · today is counted live · voice time is live-only")
+                        footer="Matches Discord's history for these days · today is live · voice time is live-only")
             notes = []
             if res["chunks_failed"]:
                 notes.append(f"{res['chunks_failed']} batch(es) failed and were left unchanged; run it again:\n"
