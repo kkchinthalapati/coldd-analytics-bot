@@ -1126,10 +1126,12 @@ def register_commands(bot: ColddBot) -> None:
                         "completed batches are saved and the rest are untouched. Run it again.", inter.guild, ui.WARN)
         else:
             problems = bool(res["chunks_failed"] or res["skipped_channels"] or res["reaction_warnings"])
+            reaction_line = (f"rebuilt for the last {res['reaction_days']} days" if res["reaction_days"]
+                             else "not rebuilt (existing counts kept)")
             e = ui.card(f"History rebuilt · last {res['days_requested']} complete days",
                         f"Days rebuilt: **{res['days_rebuilt']}** of {res['days_requested']}\n"
                         f"Messages counted: **{res['messages']:,}** from **{res['channels']}** channels and threads\n"
-                        f"Reactions: **{'rebuilt for the last ' + str(res['reaction_days']) + ' days' if res['reaction_days'] else 'not rebuilt (existing counts kept)'}**",
+                        f"Reactions: **{reaction_line}**",
                         inter.guild, ui.WARN if problems else ui.GOOD,
                         footer="Matches Discord's history for these days · today is live · voice time is live-only")
             notes = []
